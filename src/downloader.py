@@ -25,7 +25,7 @@ def download_map(doc, output_dir):
     except Exception as e:
         return f"Erro em {map_id}: {e}"
 
-def download_ranked_maps(output_dir="data/raw_maps", limit=100):
+def download_ranked_maps(output_dir="data/raw_maps", limit=300):
     """
     Baixa mapas rankeados em paralelo.
     """
@@ -63,4 +63,4 @@ def download_ranked_maps(output_dir="data/raw_maps", limit=100):
             print(future.result())
 
 if __name__ == "__main__":
-    download_ranked_maps(limit=100)
+    download_ranked_maps(limit=300)
