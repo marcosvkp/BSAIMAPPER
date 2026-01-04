@@ -1,0 +1,8 @@
+librosa
+pydub
+numpy
+torch
+pandas
+requests
+pytubefix
+imageio-ffmpeg
