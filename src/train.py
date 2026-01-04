@@ -26,28 +26,19 @@ class PreprocessedBeatSaberDataset(Dataset):
             features = np.load(path_x)
             targets = np.load(path_y)
             
-            # SAMPLING GUIADO POR EVENTOS
-            # Encontrar onde tem notas (qualquer valor > 0)
-            # targets shape: (frames, 12)
             has_note = np.any(targets > 0.1, axis=1)
             note_indices = np.where(has_note)[0]
             
             total_frames = features.shape[0]
             
             if len(note_indices) > 0 and total_frames > self.seq_len:
-                # Escolhe uma nota aleatória para ser o centro (ou parte) da janela
                 center_idx = np.random.choice(note_indices)
-                
-                # Define início aleatório, mas garantindo que a nota escolhida esteja dentro
-                # Tenta colocar a nota no meio, mas com variação
                 offset = np.random.randint(0, self.seq_len)
                 start = max(0, center_idx - offset)
                 
-                # Ajusta se estourar o final
                 if start + self.seq_len > total_frames:
                     start = max(0, total_frames - self.seq_len)
             else:
-                # Se não tiver notas (mapa vazio?) ou for curto, pega do começo
                 start = 0
                 
             end = start + self.seq_len
@@ -55,7 +46,6 @@ class PreprocessedBeatSaberDataset(Dataset):
             feat_crop = features[start:end]
             targ_crop = targets[start:end]
             
-            # Padding se necessário (para mapas muito curtos)
             if feat_crop.shape[0] < self.seq_len:
                 pad_len = self.seq_len - feat_crop.shape[0]
                 feat_crop = np.concatenate([feat_crop, np.zeros((pad_len, 82))])
@@ -67,11 +57,70 @@ class PreprocessedBeatSaberDataset(Dataset):
             print(f"Erro ao carregar {file_x}: {e}")
             return torch.zeros(self.seq_len, 82), torch.zeros(self.seq_len, 12)
 
+class VerticalDiversityLoss(nn.Module):
+    def __init__(self, pos_weight, diversity_lambda=0.1, target_dist=None):
+        super().__init__()
+        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        self.diversity_lambda = diversity_lambda
+        # Distribuição alvo: um pouco mais de notas baixas e médias, menos nas de cima.
+        if target_dist is None:
+            self.target_dist = torch.tensor([0.4, 0.4, 0.2]) 
+        else:
+            self.target_dist = torch.tensor(target_dist)
+
+    def forward(self, output, target):
+        # 1. Perda de classificação principal
+        main_loss = self.bce_loss(output, target)
+
+        # 2. Perda de diversidade vertical
+        # output shape: (batch, seq_len, 12)
+        
+        # Ativações sigmoid para interpretar como probabilidades
+        probs = torch.sigmoid(output)
+        
+        # Soma as probabilidades nas 4 colunas para cada uma das 3 linhas
+        # Linha 0 (baixa): canais 0-3
+        # Linha 1 (meio):  canais 4-7
+        # Linha 2 (cima):  canais 8-11
+        row_probs_0 = probs[:, :, 0:4].sum(dim=2)
+        row_probs_1 = probs[:, :, 4:8].sum(dim=2)
+        row_probs_2 = probs[:, :, 8:12].sum(dim=2)
+        
+        # Média de ativação por linha em todo o batch
+        avg_row_activation_0 = row_probs_0.mean()
+        avg_row_activation_1 = row_probs_1.mean()
+        avg_row_activation_2 = row_probs_2.mean()
+        
+        # Concatena em um tensor de distribuição
+        current_dist = torch.stack([
+            avg_row_activation_0, 
+            avg_row_activation_1, 
+            avg_row_activation_2
+        ])
+        
+        # Normaliza a distribuição (soma para 1)
+        current_dist = current_dist / (current_dist.sum() + 1e-6)
+        
+        # Usa KL Divergence para medir a "distância" da distribuição atual para a alvo
+        # Adiciona um pequeno epsilon para evitar log(0)
+        self.target_dist = self.target_dist.to(current_dist.device)
+        diversity_loss = nn.functional.kl_div(
+            (current_dist + 1e-6).log(), 
+            self.target_dist, 
+            reduction='batchmean'
+        )
+        
+        # 3. Combina as perdas
+        total_loss = main_loss + self.diversity_lambda * diversity_loss
+        
+        return total_loss
+
 def train():
     PROCESSED_DIR = "data/processed"
     BATCH_SIZE = 32
-    EPOCHS = 100 # Menos épocas necessárias agora que cada batch é rico
+    EPOCHS = 100
     LEARNING_RATE = 0.0005
+    DIVERSITY_LAMBDA = 0.2 # Fator de regularização. Começar baixo e aumentar se necessário.
     
     if not os.path.exists(PROCESSED_DIR) or not os.listdir(PROCESSED_DIR):
         print("Dados processados não encontrados. Execute src/preprocess_data.py!")
@@ -80,24 +129,19 @@ def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Usando dispositivo: {device}")
 
-    # seq_len menor (500 frames ~ 11s) para focar em padrões locais e aumentar a variedade do batch
     dataset = PreprocessedBeatSaberDataset(PROCESSED_DIR, seq_len=500)
-    
-    # Windows: num_workers=0 evita problemas de multiprocessing com CUDA às vezes. 
-    # Se funcionar com >0, melhor.
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, persistent_workers=True)
     
     model = get_model().to(device)
     
-    # Com sampling guiado, o desbalanceamento diminui drasticamente.
-    # Podemos reduzir o peso de 10.0 para algo mais suave, como 4.0 ou 5.0
     pos_weight = torch.ones([12]).to(device) * 5.0 
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    # Usa a nova função de perda customizada
+    criterion = VerticalDiversityLoss(pos_weight=pos_weight, diversity_lambda=DIVERSITY_LAMBDA)
     
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
     
-    print("Iniciando treinamento V3 (Sampling Guiado + BatchNorm)...")
+    print("Iniciando treinamento V4 (Loss com Diversidade Vertical)...")
     model.train()
     
     for epoch in range(EPOCHS):
@@ -122,8 +166,8 @@ def train():
         
     if not os.path.exists("models"):
         os.makedirs("models")
-    torch.save(model.state_dict(), "models/beat_saber_model.pth")
-    print("Modelo salvo!")
+    torch.save(model.state_dict(), "models/beat_saber_model_v4.pth")
+    print("Modelo V4 (com diversidade) salvo!")
 
 if __name__ == "__main__":
     train()

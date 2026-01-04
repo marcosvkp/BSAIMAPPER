@@ -69,13 +69,18 @@ def create_dataset_entry(map_folder):
     
     notes = map_data.get('colorNotes', map_data.get('_notes', []))
     
+    vertical_distribution = {0: 0, 1: 0, 2: 0}
+
     for note in notes:
         beat_time = note.get('b', note.get('_time'))
         line = note.get('x', note.get('_lineIndex'))
         layer = note.get('y', note.get('_lineLayer'))
         
         if beat_time is None or line is None or layer is None: continue
-        if line > 3 or layer > 2: continue
+        if line < 0 or line > 3 or layer < 0 or layer > 2: continue
+            
+        if layer in vertical_distribution:
+            vertical_distribution[layer] += 1
             
         idx_pos = (layer * 4) + line
         time_sec = beat_time * seconds_per_beat
@@ -91,4 +96,4 @@ def create_dataset_entry(map_folder):
             if frame_idx - 1 >= 0: 
                 target_placement[frame_idx-1, idx_pos] = max(target_placement[frame_idx-1, idx_pos], 0.2)
 
-    return features, target_placement
+    return features, target_placement, vertical_distribution
