@@ -2,41 +2,69 @@ import os
 import json
 import torch
 import numpy as np
+import shutil
 from audio_processor import detect_bpm, add_silence, extract_features
 from model import get_model
 
-def get_next_cut_direction(last_direction, hand):
+def zip_folder(folder_path, output_path):
+    """Cria um arquivo ZIP a partir de uma pasta."""
+    shutil.make_archive(output_path, 'zip', folder_path)
+    print(f"Mapa compactado em {output_path}.zip")
+
+def get_next_cut_direction(last_direction):
     """
-    Gera uma direção de corte fluida com base na direção anterior.
-    Direções: 0:Cima, 1:Baixo, 2:Esq, 3:Dir, 4:CimaEsq, 5:CimaDir, 6:BaixoEsq, 7:BaixoDir
+    Gera uma direção de corte fluida, priorizando cardinais e evitando ângulos excessivos.
+    Direções: 0:Cima, 1:Baixo, 2:Esq, 3:Dir, 4:CimaEsq, 5:CimaDir, 6:BaixoEsq, 7:BaixoDir, 8:Dot
     """
-    # Regras de flow: para cada direção, quais são as próximas válidas?
+    # Mapeia direções opostas para forçar o flow
+    opposites = {0: 1, 1: 0, 2: 3, 3: 2, 4: 7, 5: 6, 6: 5, 7: 4}
+    
+    # Probabilidades: Cardinais (70%), Diagonais (30%)
+    # Após um corte para cima (0), as próximas opções são: Baixo (1), Baixo-Esq (6), Baixo-Dir (7)
     flow_rules = {
-        0: [1, 6, 7],       # Após Cima -> Baixo, BaixoEsq, BaixoDir
-        1: [0, 4, 5],       # Após Baixo -> Cima, CimaEsq, CimaDir
-        2: [3, 5, 7],       # Após Esq -> Dir, CimaDir, BaixoDir
-        3: [2, 4, 6],       # Após Dir -> Esq, CimaEsq, BaixoEsq
-        4: [1, 3, 7],       # Após CimaEsq -> Baixo, Dir, BaixoDir
-        5: [1, 2, 6],       # Após CimaDir -> Baixo, Esq, BaixoEsq
-        6: [0, 3, 5],       # Após BaixoEsq -> Cima, Dir, CimaDir
-        7: [0, 2, 4],       # Após BaixoDir -> Cima, Esq, CimaEsq
-        8: [0, 1, 2, 3]     # Após um Dot Note, qualquer direção cardinal é válida
+        0: ([1], [6, 7]),       # Cima -> Prioriza Baixo
+        1: ([0], [4, 5]),       # Baixo -> Prioriza Cima
+        2: ([3], [5, 7]),       # Esq -> Prioriza Dir
+        3: ([2], [4, 6]),       # Dir -> Prioriza Esq
+        4: ([7], [1, 3]),       # CimaEsq -> Prioriza BaixoDir
+        5: ([6], [1, 2]),       # CimaDir -> Prioriza BaixoEsq
+        6: ([5], [0, 3]),       # BaixoEsq -> Prioriza CimaDir
+        7: ([4], [0, 2]),       # BaixoDir -> Prioriza CimaEsq
+        8: ([0, 1, 2, 3], [])  # Dot -> Qualquer cardinal
     }
     
-    valid_next = flow_rules.get(last_direction, [0, 1]) # Padrão seguro
-    return np.random.choice(valid_next)
+    cardinals, diagonals = flow_rules.get(last_direction, ([0, 1], []))
+    
+    # Se não houver opções, use um padrão seguro
+    if not cardinals and not diagonals:
+        return np.random.choice([0, 1])
 
-def post_process_notes_v5(logits, bpm, sr, hop_length, temperature=1.05, threshold=0.13, cooldown_frames=3):
+    # Pesa as probabilidades
+    choices = cardinals + diagonals
+    if len(diagonals) == 0:
+        probs = [1.0 / len(choices)] * len(choices)
+    else:
+        prob_cardinal = 0.7 / len(cardinals) if cardinals else 0
+        prob_diagonal = 0.3 / len(diagonals) if diagonals else 0
+        probs = ([prob_cardinal] * len(cardinals)) + ([prob_diagonal] * len(diagonals))
+        
+    # Normaliza probabilidades para somarem 1
+    probs = np.array(probs) / sum(probs)
+    
+    return np.random.choice(choices, p=probs)
+
+def post_process_notes_v6(logits, bpm, sr, hop_length, temperature=1.05, threshold=0.14, cooldown_frames=3):
     notes = []
     seconds_per_beat = 60.0 / bpm
     frame_duration = hop_length / sr
-    
+    min_hand_gap = (60.0 / bpm) / 2.1 # Cooldown por mão (1/2 de um beat, com uma pequena margem)
+
     logits = logits.squeeze(0) / temperature
     probs = torch.sigmoid(logits).cpu().numpy()
 
     cooldown_grid = np.zeros(12, dtype=int)
-    # Inicia com um corte para baixo, uma escolha segura e comum.
     last_cut_direction = {0: 1, 1: 1} # Mão Esq (0), Mão Dir (1)
+    last_note_time = {-1: -1, 0: -1, 1: -1} # Tempo da última nota geral, da mão esq, e da mão dir
 
     for t in range(1, probs.shape[0] - 1):
         current_probs = probs[t].copy()
@@ -51,8 +79,7 @@ def post_process_notes_v5(logits, bpm, sr, hop_length, temperature=1.05, thresho
         is_peak = (current_probs > probs[t-1]) & (current_probs > probs[t+1])
         peak_indices = np.where(is_peak & (current_probs > threshold))[0]
         
-        if len(peak_indices) == 0:
-            continue
+        if len(peak_indices) == 0: continue
             
         peak_probs = current_probs[peak_indices]
         peak_probs /= (peak_probs.sum() + 1e-6)
@@ -60,19 +87,22 @@ def post_process_notes_v5(logits, bpm, sr, hop_length, temperature=1.05, thresho
         chosen_index = np.random.choice(peak_indices, p=peak_probs)
         
         time_sec = t * frame_duration
-        beat_raw = time_sec / seconds_per_beat
-        beat_quantized = round(beat_raw * 8) / 8.0
         
-        # Cooldown de tempo um pouco mais permissivo para aumentar a densidade
-        if any(abs(n['_time'] - beat_quantized) < 0.08 for n in notes):
+        # REGRA: COOLDOWN POR MÃO
+        hand = 1 if (chosen_index % 4 >= 2) else 0
+        if time_sec - last_note_time[hand] < min_hand_gap:
+            continue
+        
+        beat_quantized = round(time_sec / seconds_per_beat * 8) / 8.0
+        
+        # Evita notas duplas no mesmo tempo quantizado
+        if abs(beat_quantized - last_note_time[-1]) < 0.01:
             continue
 
         line = chosen_index % 4
         layer = chosen_index // 4
-        hand = 1 if (line >= 2) else 0
         
-        # Usa a nova lógica de flow para determinar a direção do corte
-        cut_direction = get_next_cut_direction(last_cut_direction[hand], hand)
+        cut_direction = get_next_cut_direction(last_cut_direction[hand])
         
         note = {
             "_time": float(beat_quantized),
@@ -83,8 +113,9 @@ def post_process_notes_v5(logits, bpm, sr, hop_length, temperature=1.05, thresho
         }
         notes.append(note)
         
-        # Atualiza a última direção de corte para esta mão
         last_cut_direction[hand] = cut_direction
+        last_note_time[hand] = time_sec
+        last_note_time[-1] = beat_quantized
         
         cooldown_grid[chosen_index] = cooldown_frames
         for i in range(4):
@@ -112,7 +143,7 @@ def generate_map(audio_path, output_folder):
     
     if features is None: return
 
-    print("Gerando notas com IA V5 (Flow Rules + Densidade)...")
+    print("Gerando notas com IA V6 (Flow Control + Zip)...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     model = get_model().to(device)
@@ -129,7 +160,7 @@ def generate_map(audio_path, output_folder):
             with torch.no_grad():
                 logits = model(input_tensor)
                 
-            notes = post_process_notes_v5(logits, bpm, sr, hop_length)
+            notes = post_process_notes_v6(logits, bpm, sr, hop_length)
             print(f"Geradas {len(notes)} notas.")
 
         except Exception as e:
@@ -141,16 +172,20 @@ def generate_map(audio_path, output_folder):
 
     create_info_file(output_folder, bpm, song_filename="song.ogg")
     create_difficulty_file(output_folder, notes, bpm)
-    print(f"Mapa gerado com sucesso em {output_folder}\n")
+    
+    # Gera o ZIP
+    zip_output_path = os.path.join("output", os.path.basename(output_folder))
+    zip_folder(output_folder, zip_output_path)
+
+    print(f"Mapa gerado e compactado com sucesso em {output_folder}\n")
 
 def create_info_file(folder, bpm, song_filename="song.ogg"):
-    # (Função mantida igual)
     info = {
         "_version": "2.0.0",
         "_songName": "AI Generated Map",
         "_songSubName": "",
         "_songAuthorName": "BSIAMapper",
-        "_levelAuthorName": "Auto",
+        "_levelAuthorName": "AutoV6",
         "_beatsPerMinute": float(bpm),
         "_songTimeOffset": 0,
         "_shuffle": 0,
@@ -180,7 +215,6 @@ def create_info_file(folder, bpm, song_filename="song.ogg"):
         json.dump(info, f, indent=2)
 
 def create_difficulty_file(folder, notes, bpm):
-    # (Função mantida igual)
     final_beat = max((n['_time'] for n in notes), default=0)
     end_buffer_beats = 2.0 * (bpm / 60.0)
     diff = {
@@ -203,5 +237,7 @@ if __name__ == "__main__":
     print(f"Iniciando geração de {NUM_MAPS_TO_GENERATE} mapas diferentes...")
     
     for i in range(NUM_MAPS_TO_GENERATE):
+        # Garante que cada execução tenha um seed aleatório diferente
+        np.random.seed()
         output_folder = f"output/{BASE_OUTPUT_NAME}_{i+1}"
         generate_map(BASE_AUDIO_FILE, output_folder)
