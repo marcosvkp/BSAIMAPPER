@@ -63,4 +63,4 @@ def download_ranked_maps(output_dir="data/raw_maps", limit=300):
             print(future.result())
 
 if __name__ == "__main__":
-    download_ranked_maps(limit=300)
+    download_ranked_maps(limit=200)
