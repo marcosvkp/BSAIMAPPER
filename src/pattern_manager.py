@@ -1,139 +1,144 @@
-import numpy as np
 import random
 
+class FlowState:
+    def __init__(self, hand):
+        self.hand = hand
+        self.x = 1 if hand == 0 else 2
+        self.y = 0
+        self.cut = 1 # Começa cortando pra baixo
+
+    def update(self, x, y, cut):
+        self.x = x
+        self.y = y
+        self.cut = cut
+
 class PatternManager:
-    """
-    Gerenciador de padrões determinísticos e Regras de Flow.
-    
-    Conceito:
-    - A IA decide a INTENSIDADE e o TIMING (Onde e quão forte).
-    - Este gerenciador decide o PADRÃO (Stream, Jump, Stack) e a GEOMETRIA (Posição, Ângulo).
-    """
-    
     def __init__(self):
-        # Estado do Flow
-        self.left_hand_pos = (0, 0) # (Line, Layer)
-        self.right_hand_pos = (3, 0)
-        self.last_time = 0
-        self.parity = 1 # 1 = Direita, 0 = Esquerda (Começa com a direita)
+        self.left = FlowState(0)
+        self.right = FlowState(1)
+        self.parity = 1 # 1=Direita
         
-        # Definição de Padrões (Templates Relativos)
-        # Formato: Lista de passos. Cada passo pode ter notas para esq/dir.
+        # Definição de Padrões por Complexidade
         self.patterns = {
-            'single': [
-                {'type': 'single'} 
-            ],
-            'double_down': [
-                {'type': 'double', 'cut': 1} # Corte para baixo
-            ],
-            'stack': [
-                {'type': 'single'}, 
-                {'type': 'single', 'offset': 0.05} # Nota rápida logo depois
-            ],
-            'stream_2': [
-                {'type': 'single'},
-                {'type': 'single', 'offset': 0.125} # 1/4 beat a 120bpm
-            ],
-            'slider_diagonal': [
-                {'type': 'single', 'cut': 6}, # Diagonal
-                {'type': 'single', 'cut': 6, 'offset': 0.1, 'slide': True}
-            ]
+            # 0: Chill (Baixa energia)
+            0: ['single_flow', 'stack_simple'],
+            # 1: Dance (Média energia)
+            1: ['wide_flow', 'diagonal_cross', 'window_wipe'],
+            # 2: Tech/Stream (Alta energia)
+            2: ['stream_burst', 'tech_angle', 'double_down']
         }
 
-    def get_pattern_for_intensity(self, intensity, time_gap):
+    def get_pattern(self, intensity, complexity_idx, vertical_idx, time_gap):
         """
-        Seleciona um padrão baseado na intensidade (probabilidade da IA) e tempo desde a última nota.
+        Seleciona padrão baseado nas 3 cabeças da IA.
         """
-        # Se for muito rápido (menos de 0.2s), força stream ou ignora para evitar spam impossível
-        if time_gap < 0.15:
-            return None # Cooldown forçado
+        # Cooldown forçado para evitar spam impossível
+        if time_gap < 0.12: return None
+        
+        # Se o gap for muito pequeno, força stream independente da IA
+        if time_gap < 0.22:
+            return {'type': 'stream_burst', 'vert': vertical_idx}
             
-        if time_gap < 0.25:
-            return self.patterns['stream_2']
-            
-        # Alta intensidade
-        if intensity > 0.85:
-            choices = ['double_down', 'slider_diagonal', 'stack']
-            weights = [0.4, 0.3, 0.3]
-            key = random.choices(choices, weights=weights)[0]
-            return self.patterns[key]
-            
-        # Intensidade média/baixa -> Single notes com bom flow
-        return self.patterns['single']
+        # Escolhe padrão baseado na complexidade predita pela IA
+        options = self.patterns.get(complexity_idx, self.patterns[1])
+        chosen_type = random.choice(options)
+        
+        return {
+            'type': chosen_type,
+            'vert': vertical_idx, # 0=Baixo, 1=Meio, 2=Cima
+            'intensity': intensity
+        }
 
-    def apply_pattern(self, pattern, base_time, bpm):
-        """
-        Gera as notas reais aplicando regras de paridade e flow.
-        """
-        if pattern is None:
-            return []
-            
+    def apply_pattern(self, meta, time, bpm):
+        if not meta: return []
+        
+        ptype = meta['type']
+        vert_bias = meta['vert']
+        
         notes = []
         
-        for step in pattern:
-            current_time = base_time + step.get('offset', 0)
+        if ptype == 'single_flow':
+            notes = self._gen_flow(time, vert_bias)
             
-            # Lógica de Paridade (Alternância de mãos)
-            # Se for 'double', usa as duas mãos
-            if step['type'] == 'double':
-                # Mão Esquerda
-                note_l = self._create_note(0, current_time, step.get('cut', 1))
-                # Mão Direita
-                note_r = self._create_note(1, current_time, step.get('cut', 1))
-                notes.append(note_l)
-                notes.append(note_r)
-                # Resetar paridade ou manter? Em doubles geralmente reseta ou alterna ambas.
-                # Vamos manter a alternância simples para o próximo single.
-                
-            else: # Single
-                hand = self.parity
-                note = self._create_note(hand, current_time, step.get('cut', None))
-                notes.append(note)
-                
-                # Alterna a mão para a próxima nota
-                self.parity = 1 - self.parity
-                
+        elif ptype == 'wide_flow':
+            notes = self._gen_wide(time, vert_bias)
+            
+        elif ptype == 'stream_burst':
+            notes = self._gen_flow(time, vert_bias, force_inversion=True)
+            
+        elif ptype == 'double_down':
+            notes = self._gen_double(time, vert_bias)
+            
+        elif ptype == 'tech_angle':
+            notes = self._gen_tech(time, vert_bias)
+            
+        else:
+            notes = self._gen_flow(time, vert_bias)
+            
+        self.parity = 1 - self.parity
         return notes
 
-    def _create_note(self, hand, time, forced_cut=None):
-        """
-        Cria uma nota calculando a melhor posição e direção baseada na posição anterior da mão.
-        """
-        # Posição anterior da mão atual
-        prev_line, prev_layer = self.left_hand_pos if hand == 0 else self.right_hand_pos
+    # --- Geradores ---
+    
+    def _gen_flow(self, time, v_bias, force_inversion=False):
+        hand = self.parity
+        state = self.right if hand == 1 else self.left
         
-        # Decidir nova posição (Heurística simples de Flow)
-        # Se a mão estava na esquerda (line 0/1), tende a ir para o meio ou ficar.
-        # Se a mão estava em baixo (layer 0), tende a ir para cima (layer 1/2) para cortar para baixo.
+        # Lógica de Flow: Se estava em baixo, vai pra cima
+        if state.y == 0: target_y = random.choice([1, 2])
+        else: target_y = 0
         
-        # Regra básica: Reset para posição confortável
-        if hand == 0: # Esquerda
-            new_line = random.choice([0, 1])
-        else: # Direita
-            new_line = random.choice([2, 3])
+        # Bias da IA: Se a IA quer "Cima" (2), forçamos layer mais alta
+        if v_bias == 2: target_y = max(1, target_y)
+        if v_bias == 0: target_y = min(1, target_y)
+        
+        # Direção do corte
+        if target_y > state.y: cut = 0 # Cima
+        else: cut = 1 # Baixo
+        
+        # Variação angular (Tech)
+        if random.random() > 0.7:
+            if hand == 0: cut = 6 if cut == 1 else 4 # Diagonais Esq
+            else: cut = 7 if cut == 1 else 5 # Diagonais Dir
             
-        # Alternância de altura
-        if prev_layer == 0:
-            new_layer = 1 # Vai para o meio
-            cut_direction = 1 # Corte para baixo (Down)
-        else:
-            new_layer = 0 # Vai para baixo
-            cut_direction = 0 # Corte para cima (Up)
-            
-        # Se o padrão forçou um corte (ex: slider), usa ele
-        if forced_cut is not None:
-            cut_direction = forced_cut
-            
-        # Atualiza estado
-        if hand == 0:
-            self.left_hand_pos = (new_line, new_layer)
-        else:
-            self.right_hand_pos = (new_line, new_layer)
-            
-        return {
+        line = random.choice([0, 1]) if hand == 0 else random.choice([2, 3])
+        
+        return self._create_note(hand, time, line, target_y, cut)
+
+    def _gen_wide(self, time, v_bias):
+        # Padrão amplo: usa as pontas (0 e 3)
+        hand = self.parity
+        line = 0 if hand == 0 else 3
+        layer = 0 if v_bias == 0 else 1
+        cut = 1 # Geralmente corte pra baixo em wide jumps
+        
+        # Adiciona diagonal para dentro
+        if hand == 0: cut = 7
+        else: cut = 6
+        
+        return self._create_note(hand, time, line, layer, cut)
+
+    def _gen_double(self, time, v_bias):
+        # Duas notas ao mesmo tempo
+        l_note = self._create_note(0, time, 1, 0, 1)[0]
+        r_note = self._create_note(1, time, 2, 0, 1)[0]
+        return [l_note, r_note]
+
+    def _gen_tech(self, time, v_bias):
+        # Notas com ângulos estranhos (Dot notes ou laterais)
+        hand = self.parity
+        line = 1 if hand == 0 else 2
+        layer = 1
+        cut = 2 if hand == 0 else 3 # Corte lateral
+        return self._create_note(hand, time, line, layer, cut)
+
+    def _create_note(self, hand, time, line, layer, cut):
+        state = self.right if hand == 1 else self.left
+        state.update(line, layer, cut)
+        return [{
             "_time": time,
-            "_lineIndex": new_line,
-            "_lineLayer": new_layer,
+            "_lineIndex": line,
+            "_lineLayer": layer,
             "_type": hand,
-            "_cutDirection": cut_direction
-        }
+            "_cutDirection": cut
+        }]

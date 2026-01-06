@@ -1,17 +1,15 @@
 import torch
 import torch.nn as nn
 
-class BeatNet(nn.Module):
+class DirectorNet(nn.Module):
     """
-    Modelo OTIMIZADO para detecção de ritmo (Onsets).
-    Foca apenas em 'QUANDO' colocar uma nota.
-    Substitui o modelo pesado anterior por uma arquitetura CRNN (Conv + GRU) leve.
+    Modelo 'Diretor': Não apenas detecta beats, mas dirige o estilo.
     """
     def __init__(self, input_size=82, hidden_size=128):
-        super(BeatNet, self).__init__()
+        super(DirectorNet, self).__init__()
         
-        # 1. Feature Extractor (CNN 1D)
-        # Reduz a dimensionalidade temporal e extrai padrões locais
+        # --- Backbone (Compartilhado) ---
+        # Extrai características musicais brutas
         self.conv1 = nn.Conv1d(input_size, 64, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm1d(64)
         self.relu = nn.ReLU()
@@ -20,46 +18,37 @@ class BeatNet(nn.Module):
         self.conv2 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm1d(128)
         
-        # 2. Temporal Context (GRU)
-        # GRU é ~25% mais rápido que LSTM e consome menos VRAM
-        # Bidirecional para olhar passado e futuro
         self.gru = nn.GRU(128, hidden_size, num_layers=2, batch_first=True, bidirectional=True)
         
-        # 3. Classifier
-        # Saída binária: 1 = Tem nota, 0 = Não tem nota
-        self.fc = nn.Linear(hidden_size * 2, 1) 
+        # --- Heads (Especialistas) ---
+        
+        # Head 1: Beat Detection (Quando bater?)
+        # Saída: Probabilidade (0-1)
+        self.fc_beat = nn.Linear(hidden_size * 2, 1)
+        
+        # Head 2: Complexity Control (Qual padrão usar?)
+        # Saída: 3 Classes (0: Chill, 1: Dance, 2: Tech/Stream)
+        self.fc_complexity = nn.Linear(hidden_size * 2, 3)
+        
+        # Head 3: Vertical Bias (Onde focar?)
+        # Saída: 3 Classes (0: Baixo, 1: Meio, 2: Cima)
+        self.fc_vertical = nn.Linear(hidden_size * 2, 3)
         
     def forward(self, x):
-        # x: (batch, time, features) -> (batch, features, time) para CNN
+        # Backbone
         x = x.permute(0, 2, 1)
-        
         x = self.dropout(self.relu(self.bn1(self.conv1(x))))
         x = self.relu(self.bn2(self.conv2(x)))
-        
-        # Volta para (batch, time, features) para RNN
         x = x.permute(0, 2, 1)
         
-        out, _ = self.gru(x)
+        feat, _ = self.gru(x)
         
-        logits = self.fc(out)
-        return logits
-
-class ComplexityNet(nn.Module):
-    """
-    Modelo opcional para classificar a 'intensidade' ou 'tipo de padrão' do trecho.
-    Ex: 0 = Vazio, 1 = Single Notes, 2 = Stream/Burst
-    """
-    def __init__(self, input_size=82, hidden_size=64, num_classes=3):
-        super(ComplexityNet, self).__init__()
-        self.conv1 = nn.Conv1d(input_size, 32, kernel_size=5, padding=2)
-        self.pool = nn.AdaptiveAvgPool1d(1) # Global Pooling
-        self.fc = nn.Linear(32, num_classes)
+        # Heads
+        beat_logits = self.fc_beat(feat)
+        complexity_logits = self.fc_complexity(feat)
+        vertical_logits = self.fc_vertical(feat)
         
-    def forward(self, x):
-        x = x.permute(0, 2, 1)
-        x = torch.relu(self.conv1(x))
-        x = self.pool(x).squeeze(-1)
-        return self.fc(x)
+        return beat_logits, complexity_logits, vertical_logits
 
-def get_beat_model():
-    return BeatNet()
+def get_model():
+    return DirectorNet()

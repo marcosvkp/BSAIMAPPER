@@ -4,12 +4,68 @@ from data_loader import create_dataset_entry
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 
+def calculate_metadata(targets, window=200):
+    """
+    Gera metadados (Complexidade e Verticalidade) baseados no contexto local do mapa.
+    Isso ensina a IA a entender 'contexto' e não apenas 'notas'.
+    
+    Retorna array (num_frames, 2) onde:
+    col 0: Complexidade (0=Baixa, 1=Média, 2=Alta)
+    col 1: Verticalidade (0=Baixo, 1=Meio, 2=Cima)
+    """
+    num_frames = targets.shape[0]
+    metadata = np.zeros((num_frames, 2), dtype=np.float32)
+    
+    # Auxiliar: Onde tem nota?
+    has_note = np.any(targets > 0.1, axis=1)
+    
+    # Otimização: Calcular em passos de 10 frames e preencher (suficiente para contexto)
+    step = 10
+    half_window = window // 2
+    
+    for i in range(0, num_frames, step):
+        start = max(0, i - half_window)
+        end = min(num_frames, i + half_window)
+        
+        # --- 1. Complexidade (Densidade Local) ---
+        chunk_notes = has_note[start:end]
+        if len(chunk_notes) == 0:
+            density = 0
+        else:
+            density = np.sum(chunk_notes) / len(chunk_notes)
+            
+        # Limiares empíricos baseados em mapas Expert+
+        if density > 0.15: comp_val = 2.0 # Alta/Tech/Stream
+        elif density > 0.05: comp_val = 1.0 # Média/Dance
+        else: comp_val = 0.0 # Baixa/Chill
+        
+        # --- 2. Verticalidade (Altura Média Ponderada) ---
+        chunk_targets = targets[start:end]
+        # Somar ativações por layer
+        l0 = np.sum(chunk_targets[:, 0:4]) # Layer 0 (Baixo)
+        l1 = np.sum(chunk_targets[:, 4:8]) # Layer 1 (Meio)
+        l2 = np.sum(chunk_targets[:, 8:12]) # Layer 2 (Cima)
+        total = l0 + l1 + l2 + 1e-6
+        
+        # Média ponderada (0, 1, 2)
+        avg_height = (0*l0 + 1*l1 + 2*l2) / total
+        vert_val = round(avg_height)
+        
+        # Preencher o bloco atual com os valores calculados
+        fill_end = min(num_frames, i + step)
+        metadata[i:fill_end, 0] = comp_val
+        metadata[i:fill_end, 1] = vert_val
+        
+    return metadata
+
 def process_map(map_folder, processed_dir):
     map_id = os.path.basename(map_folder)
     save_path_x = os.path.join(processed_dir, f"{map_id}_x.npy")
     save_path_y = os.path.join(processed_dir, f"{map_id}_y.npy")
+    save_path_meta = os.path.join(processed_dir, f"{map_id}_meta.npy")
 
-    if os.path.exists(save_path_x) and os.path.exists(save_path_y):
+    # Se já existe tudo (incluindo meta), pula
+    if os.path.exists(save_path_x) and os.path.exists(save_path_y) and os.path.exists(save_path_meta):
         return None, map_id, "already_processed"
 
     try:
@@ -19,8 +75,12 @@ def process_map(map_folder, processed_dir):
             
         features, targets, vertical_dist = data
         
+        # Calcular Metadados (Novidade V5)
+        metadata = calculate_metadata(targets)
+        
         np.save(save_path_x, features)
         np.save(save_path_y, targets)
+        np.save(save_path_meta, metadata)
         
         return vertical_dist, map_id, "success"
         
@@ -34,6 +94,7 @@ def preprocess_all(raw_dir="data/raw_maps", processed_dir="data/processed", max_
     map_folders = [os.path.join(raw_dir, d) for d in os.listdir(raw_dir) if os.path.isdir(os.path.join(raw_dir, d))]
     
     print(f"Encontrados {len(map_folders)} mapas para processar.")
+    print("Gerando features, targets e METADADOS (Complexidade/Verticalidade)...")
     
     total_vertical_distribution = Counter()
     processed_count = 0
@@ -53,22 +114,8 @@ def preprocess_all(raw_dir="data/raw_maps", processed_dir="data/processed", max_
             elif status.startswith("fatal_error"):
                 print(f"Erro fatal em {map_id}: {status}")
 
-    print(f"\nConcluído! {processed_count} novos mapas processados e salvos em {processed_dir}")
-
-    # Análise da Distribuição Vertical
-    total_notes = sum(total_vertical_distribution.values())
-    if total_notes > 0:
-        print("\nAnálise de Distribuição Vertical do Dataset:")
-        print(f"Total de notas analisadas: {total_notes}")
-        
-        dist_percent = {row: (count / total_notes) * 100 for row, count in total_vertical_distribution.items()}
-        
-        print(f"  - Linha 0 (Baixo): {dist_percent.get(0, 0):.2f}%")
-        print(f"  - Linha 1 (Meio):  {dist_percent.get(1, 0):.2f}%")
-        print(f"  - Linha 2 (Cima):  {dist_percent.get(2, 0):.2f}%")
-    else:
-        print("\nNenhuma nota nova foi processada para analisar a distribuição.")
+    print(f"\nConcluído! {processed_count} mapas processados em {processed_dir}")
 
 if __name__ == "__main__":
-    # Ajuste max_workers conforme o número de núcleos da sua CPU para melhor performance
+    # Ajuste max_workers conforme sua CPU
     preprocess_all(max_workers=os.cpu_count() or 4)
