@@ -39,7 +39,6 @@ def generate_map_optimized(audio_path, output_folder):
     with torch.no_grad():
         p_beat, p_comp, p_vert = model(inputs)
         beat_probs = torch.sigmoid(p_beat).squeeze().cpu().numpy()
-        # Correção do índice do argmax (dim=2)
         comp_classes = torch.argmax(p_comp, dim=2).squeeze().cpu().numpy()
         vert_classes = torch.argmax(p_vert, dim=2).squeeze().cpu().numpy()
         
@@ -53,13 +52,22 @@ def generate_map_optimized(audio_path, output_folder):
     cooldown = int(0.1 / frame_dur)
     last_frame = -cooldown
     
+    # --- REGRA DE OURO: TEMPO MÍNIMO DE INÍCIO ---
+    MIN_START_TIME = 3.0 # Segundos
+    # ---------------------------------------------
+
     print("Gerando com Director AI...")
     
     for i in range(len(beat_probs)):
+        # Verifica tempo mínimo antes de qualquer coisa
+        time_sec = i * frame_dur
+        if time_sec < MIN_START_TIME:
+            continue
+
         if beat_probs[i] > threshold and (i - last_frame) > cooldown:
             if i > 0 and i < len(beat_probs)-1:
                 if beat_probs[i] > beat_probs[i-1] and beat_probs[i] > beat_probs[i+1]:
-                    time_sec = i * frame_dur
+                    
                     beat_time = round((time_sec / sec_per_beat) * 8) / 8
                     
                     comp_idx = comp_classes[i]
@@ -73,15 +81,11 @@ def generate_map_optimized(audio_path, output_folder):
                     raw_notes.extend(new_notes)
                     last_frame = i
     
-    # --- PÓS-PROCESSAMENTO DE FLOW E PARIDADE ---
     print("Aplicando FlowFixer (Simulação de Paridade e Resets)...")
-    # O FlowFixer agora retorna uma lista mista de Notas e Bombas
     all_objects = FlowFixer.fix(raw_notes, bpm)
     
-    # Separar Notas e Bombas para o JSON
     final_notes = [obj for obj in all_objects if obj['_type'] != 3]
     final_bombs = [obj for obj in all_objects if obj['_type'] == 3]
-    # --------------------------------------------
                     
     save_beatmap(final_notes, final_bombs, bpm, output_folder, processed_audio)
     zip_folder(output_folder, os.path.join("output", os.path.basename(output_folder)))
@@ -90,11 +94,24 @@ def save_beatmap(notes, bombs, bpm, folder, audio_name):
     notes.sort(key=lambda x: x['_time'])
     bombs.sort(key=lambda x: x['_time'])
     
+    # Remove duplicatas de bombas (caso o FlowFixer gere bombas sobrepostas para as duas mãos)
+    unique_bombs = []
+    seen_bombs = set()
+    for b in bombs:
+        # Chave única: tempo + linha + layer
+        key = (round(b['_time'], 3), b['_lineIndex'], b['_lineLayer'])
+        if key not in seen_bombs:
+            seen_bombs.add(key)
+            unique_bombs.append(b)
+
+    all_notes_v2 = notes + unique_bombs
+    all_notes_v2.sort(key=lambda x: x['_time'])
+
     diff = {
         "_version": "2.0.0",
-        "_notes": notes,
+        "_notes": all_notes_v2,
         "_events": [],
-        "_obstacles": [], # Obstáculos podem ser adicionados futuramente
+        "_obstacles": [],
         "_customData": {
             "_time": notes[-1]['_time'] + 4 if notes else 0,
             "_BPMChanges": [],
@@ -102,19 +119,10 @@ def save_beatmap(notes, bombs, bpm, folder, audio_name):
         }
     }
     
-    # Adiciona as bombas geradas pelo FlowFixer (se houver suporte no formato v2, bombas ficam em _notes com type 3)
-    # No formato V2 padrão, bombas são notas com type=3.
-    # O FlowFixer já gera com type=3, então podemos apenas juntar tudo em _notes se quisermos seguir estritamente V2.
-    # Mas para clareza, vamos garantir que o JSON final tenha tudo em _notes.
-    
-    all_notes_v2 = notes + bombs
-    all_notes_v2.sort(key=lambda x: x['_time'])
-    diff["_notes"] = all_notes_v2
-
     info = {
         "_version": "2.1.0",
         "_songName": "AI Director Map",
-        "_songSubName": "Ranked Style Flow",
+        "_songSubName": "FlowFixer V5",
         "_songAuthorName": "BSIAMapper",
         "_levelAuthorName": "AI",
         "_beatsPerMinute": float(bpm),
@@ -126,7 +134,7 @@ def save_beatmap(notes, bombs, bpm, folder, audio_name):
                 "_difficulty": "ExpertPlus",
                 "_beatmapFilename": "ExpertPlus.dat",
                 "_noteJumpMovementSpeed": 18,
-                "_noteJumpStartBeatOffset": 0
+                "_noteJumpStartBeatOffset": -0.784
             }]
         }]
     }

@@ -2,8 +2,8 @@ import math
 
 class FlowFixer:
     """
-    Simulador de Paridade e Corretor de Flow (V4 - Híbrido).
-    Mantém a liberdade da V2, as bombas da V3 e limpa o meio.
+    Simulador de Paridade e Corretor de Flow (V6 - Resets Longos e Seguros).
+    Foco: Bombas apenas em pausas longas e reentrada correta (Down Cut).
     """
 
     # Constantes
@@ -21,25 +21,43 @@ class FlowFixer:
         left = [n for n in notes if n['_type'] == FlowFixer.LEFT_HAND]
         right = [n for n in notes if n['_type'] == FlowFixer.RIGHT_HAND]
         
-        fixed_left = FlowFixer._process_hand(left, bpm, FlowFixer.LEFT_HAND)
-        fixed_right = FlowFixer._process_hand(right, bpm, FlowFixer.RIGHT_HAND)
+        fixed_left, resets_left = FlowFixer._process_hand(left, bpm, FlowFixer.LEFT_HAND)
+        fixed_right, resets_right = FlowFixer._process_hand(right, bpm, FlowFixer.RIGHT_HAND)
         
-        all_obj = fixed_left + fixed_right
+        # Unifica os tempos de reset
+        all_resets = sorted(list(set(resets_left + resets_right)))
+        
+        # Gera Parede de Bombas Global (4 colunas)
+        bombs = []
+        for t in all_resets:
+            for col in range(4): 
+                bombs.append({
+                    "_time": t,
+                    "_lineIndex": col,
+                    "_lineLayer": 0, # Chão
+                    "_type": FlowFixer.BOMB,
+                    "_cutDirection": 0
+                })
+
+        all_obj = fixed_left + fixed_right + bombs
         all_obj.sort(key=lambda x: x['_time'])
         return all_obj
 
     @staticmethod
     def _process_hand(hand_notes, bpm, hand_type):
-        if not hand_notes: return []
+        if not hand_notes: return [], []
 
         processed = []
+        resets = []
         sec_per_beat = 60 / bpm
-        BOMB_THRESHOLD = 0.8 
+        
+        # --- REGRA DE OURO: TEMPO MÍNIMO PARA BOMBA ---
+        # Só gera bomba se houver um buraco de pelo menos 3.0 segundos (ex: 1.5s antes, 1.5s depois)
+        BOMB_THRESHOLD = 3.0 
 
         prev_ended_up = False 
         prev_note = hand_notes[0]
         
-        # Sanitização inicial
         prev_note = FlowFixer._sanitize_note(prev_note, hand_type)
         processed.append(prev_note)
 
@@ -49,71 +67,66 @@ class FlowFixer:
             curr_note = hand_notes[i]
             time_diff = (curr_note['_time'] - prev_note['_time']) * sec_per_beat
             
-            # --- 1. SANITIZAÇÃO (Ajuste solicitado) ---
-            # Remove cortes laterais no meio e cortes ruins nas pontas
             curr_note = FlowFixer._sanitize_note(curr_note, hand_type)
-
-            # --- 2. PARIDADE E RESETS ---
             curr_cut = curr_note['_cutDirection']
             
-            # Determina intenção
+            # Determina intenção atual
             curr_goes_up = False
             if curr_cut in [0, 4, 5]: curr_goes_up = True
             elif curr_cut in [1, 6, 7]: curr_goes_up = False
             elif curr_cut == 8: curr_goes_up = curr_note['_lineLayer'] >= 1
-            else: curr_goes_up = prev_ended_up # Laterais mantêm estado
+            else: curr_goes_up = prev_ended_up 
 
-            is_reset = (prev_ended_up and curr_goes_up) or (not prev_ended_up and not curr_goes_up)
+            # Verifica necessidade de Reset (Quebra de Flow)
+            is_reset_needed = (prev_ended_up and curr_goes_up) or (not prev_ended_up and not curr_goes_up)
 
-            if is_reset:
+            # Lógica de Decisão: Corrigir ou Resetar?
+            if is_reset_needed:
                 if time_diff < BOMB_THRESHOLD:
-                    # Reset Rápido -> Inverter Nota
+                    # --- CASO 1: Intervalo Curto/Médio -> CORRIGIR NOTA ---
+                    # Não há tempo para reset confortável com bomba.
+                    # Solução: Inverter a nota para manter o flow contínuo.
                     new_cut = FlowFixer._get_inverse_cut(curr_cut)
-                    # Verifica ergonomia da inversão
+                    
                     if FlowFixer._is_bad_angle(new_cut, curr_note['_lineIndex'], hand_type):
                         curr_note['_cutDirection'] = 8 # Dot
                     else:
                         curr_note['_cutDirection'] = new_cut
+                    
+                    # O flow foi corrigido, então a intenção inverteu
                     curr_goes_up = not prev_ended_up 
 
                 else:
-                    # Reset Longo -> PAREDE DE BOMBAS (V3 Style)
-                    # Gera bombas nas duas colunas da mão, na layer 0
+                    # --- CASO 2: Intervalo Longo (> 3s) -> RESET COM BOMBA ---
                     bomb_time = (prev_note['_time'] + curr_note['_time']) / 2
+                    resets.append(bomb_time)
                     
-                    cols = [0, 1] if hand_type == 0 else [2, 3]
-                    for col in cols:
-                        processed.append({
-                            "_time": bomb_time,
-                            "_lineIndex": col,
-                            "_lineLayer": 0, # Sempre no chão
-                            "_type": 3,
-                            "_cutDirection": 0
-                        })
+                    # --- CORREÇÃO DE REENTRADA (CRÍTICO) ---
+                    # Se houve bomba no chão, o jogador levantou a mão.
+                    # A próxima nota TEM que ser um corte para BAIXO (ou Dot).
+                    # Se for corte para CIMA, é impossível (braço já está em cima).
+                    if curr_goes_up: # Se a nota original era pra cima
+                        # Força para baixo
+                        curr_note['_cutDirection'] = 1 # Down
+                        curr_goes_up = False # Agora vai pra baixo
             
             processed.append(curr_note)
             prev_note = curr_note
             prev_ended_up = curr_goes_up
 
-        return processed
+        return processed, resets
 
     @staticmethod
     def _sanitize_note(note, hand):
-        """
-        Remove padrões proibidos.
-        """
         line = note['_lineIndex']
         cut = note['_cutDirection']
         
-        # REGRA CRÍTICA: Remover laterais no meio
-        # Se a nota está na coluna 1 ou 2 E o corte é Esquerda (2) ou Direita (3)
+        # Remove laterais no meio
         if line in [1, 2] and cut in [2, 3]:
-            # Transforma em Dot Note (8)
-            # Isso mantém o ritmo mas remove a exigência angular ruim
             note['_cutDirection'] = 8
             return note
 
-        # REGRA: Proibido cortar para fora nas extremidades (Torção de pulso)
+        # Remove cortes para fora nas pontas
         if hand == 0 and line == 0 and cut in [3, 5, 7]: note['_cutDirection'] = 8
         if hand == 1 and line == 3 and cut in [2, 4, 6]: note['_cutDirection'] = 8
         
