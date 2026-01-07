@@ -13,10 +13,11 @@ class FlowState:
         self.cut = cut
 
 class PatternManager:
-    def __init__(self):
+    def __init__(self, difficulty="ExpertPlus"):
         self.left = FlowState(0)
         self.right = FlowState(1)
         self.parity = 1 # 1=Direita
+        self.difficulty = difficulty
         
         # Definição de Padrões por Complexidade
         self.patterns = {
@@ -32,45 +33,82 @@ class PatternManager:
         """
         Seleciona padrão baseado nas 3 cabeças da IA e na ENERGIA GLOBAL.
         """
+        # --- Restrições por Dificuldade ---
+        max_complexity = 2
+        allow_bursts = True
+        
+        if self.difficulty == "Easy":
+            max_complexity = 0
+            allow_bursts = False
+            # Força gap mínimo maior para Easy
+            if time_gap < 0.5: return None
+            
+        elif self.difficulty == "Normal":
+            max_complexity = 1
+            allow_bursts = False
+            if time_gap < 0.3: return None
+            
+        elif self.difficulty == "Hard":
+            max_complexity = 1 # Maioria Dance/Chill
+            # Permite alguns Tech simples se energia for alta, mas sem bursts loucos
+            if energy_level > 0.8: max_complexity = 2
+            allow_bursts = False
+            if time_gap < 0.2: return None
+            
+        elif self.difficulty == "Expert":
+            max_complexity = 2
+            allow_bursts = True # Mas controlado
+            
+        # ExpertPlus é o padrão sem restrições (max_complexity=2, allow_bursts=True)
+
         # --- 1. Filtro de Energia (Global) ---
         if energy_level < 0.3:
             complexity_idx = 0
-            if time_gap < 0.4: return None 
+            if time_gap < 0.4 and self.difficulty not in ["Easy", "Normal"]: return None 
 
-        if energy_level > 0.8:
-            complexity_idx = 2 # Força Tech/Stream
-            
+        # Ajusta complexidade sugerida pela IA aos limites da dificuldade
+        if complexity_idx > max_complexity:
+            complexity_idx = max_complexity
+
         # --- 2. Cooldown Dinâmico ---
         min_gap = 0.12
         if energy_level > 0.7: min_gap = 0.08
         if energy_level < 0.4: min_gap = 0.25
         
+        # Sobrescreve min_gap se a dificuldade exigir mais espaço (já tratado acima, mas reforçando)
+        if self.difficulty == "Easy": min_gap = 0.5
+        if self.difficulty == "Normal": min_gap = 0.3
+        if self.difficulty == "Hard": min_gap = 0.2
+        
         if time_gap < min_gap: return None
         
-        # Se o gap for muito pequeno, força stream independente da IA
-        if time_gap < 0.22 and energy_level > 0.5:
-            return {'type': 'stream_burst', 'vert': vertical_idx}
+        # Se o gap for muito pequeno, força stream independente da IA (Apenas Expert/ExpertPlus)
+        if self.difficulty in ["Expert", "ExpertPlus"]:
+            if time_gap < 0.22 and energy_level > 0.5:
+                return {'type': 'stream_burst', 'vert': vertical_idx}
             
         options = self.patterns.get(complexity_idx, self.patterns[1])
         
+        # Filtrar padrões muito complexos se estivermos limitando (ex: Hard não deve ter super_stream)
+        if not allow_bursts:
+            options = [p for p in options if p not in ['burst_fill', 'super_stream', 'stream_burst']]
+            if not options: options = self.patterns[0] # Fallback para Chill
+
         # --- Lógica de Drop Agressiva ---
-        
-        # Se a energia for muito alta (> 0.85), chance de SUPER STREAM (8 notas)
-        if energy_level > 0.85:
-            if random.random() < 0.3: # 30% de chance de iniciar um stream longo
-                return {'type': 'super_stream', 'vert': vertical_idx, 'intensity': intensity}
-        
-        # Se a energia for alta (> 0.65), chance de BURST FILL (4 notas)
-        # Reduzido de 0.85 para 0.65 para pegar mais drops
-        if energy_level > 0.65:
-            # Probabilidade escala com a energia: 0.65 -> 20%, 0.95 -> 60%
-            burst_prob = 0.2 + (energy_level - 0.65) * 1.3
-            if random.random() < burst_prob:
-                return {'type': 'burst_fill', 'vert': vertical_idx, 'intensity': intensity}
+        if allow_bursts:
+            # Se a energia for muito alta (> 0.85), chance de SUPER STREAM (8 notas)
+            if energy_level > 0.85:
+                if random.random() < 0.3: # 30% de chance de iniciar um stream longo
+                    return {'type': 'super_stream', 'vert': vertical_idx, 'intensity': intensity}
             
-            # Chance de Double Down também aumenta
-            if random.random() < 0.25:
-                return {'type': 'double_down', 'vert': vertical_idx, 'intensity': intensity}
+            # Se a energia for alta (> 0.65), chance de BURST FILL (4 notas)
+            if energy_level > 0.65:
+                burst_prob = 0.2 + (energy_level - 0.65) * 1.3
+                if random.random() < burst_prob:
+                    return {'type': 'burst_fill', 'vert': vertical_idx, 'intensity': intensity}
+                
+                if random.random() < 0.25:
+                    return {'type': 'double_down', 'vert': vertical_idx, 'intensity': intensity}
 
         chosen_type = random.choice(options)
         
@@ -94,6 +132,16 @@ class PatternManager:
         elif ptype == 'wide_flow':
             notes = self._gen_wide(time, vert_bias)
             
+        elif ptype == 'stack_simple':
+             # Adicionando implementação simples de stack se faltar, ou usando flow
+             notes = self._gen_flow(time, vert_bias)
+
+        elif ptype == 'diagonal_cross':
+             notes = self._gen_wide(time, vert_bias) # Reutilizando wide por enquanto
+
+        elif ptype == 'window_wipe':
+             notes = self._gen_wide(time, vert_bias) # Reutilizando wide por enquanto
+
         elif ptype == 'stream_burst':
             notes = self._gen_flow(time, vert_bias, force_inversion=True)
             

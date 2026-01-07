@@ -1,10 +1,10 @@
 import os
+import requests
 from pytubefix import YouTube
 import imageio_ffmpeg
 from pydub import AudioSegment
-
-from pydub import AudioSegment
-from pydub.utils import which
+from PIL import Image
+from io import BytesIO
 
 AudioSegment.converter = r"C:\ffmpeg\bin\ffmpeg.exe"
 AudioSegment.ffprobe = r"C:\ffmpeg\bin\ffprobe.exe"
@@ -13,6 +13,9 @@ def download_from_youtube(url, output_folder="data/input_music"):
     """
     Baixa o áudio de um vídeo do YouTube usando pytubefix,
     converte para MP3 e também cria uma versão OGG (.egg) usando pydub.
+    Também baixa a thumbnail e salva como cover.png.
+    
+    Retorna uma tupla: (caminho_mp3, caminho_cover)
     """
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
@@ -21,22 +24,27 @@ def download_from_youtube(url, output_folder="data/input_music"):
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     AudioSegment.converter = ffmpeg_path
     
-    # O pydub precisa do ffprobe também para ler alguns formatos.
-    # Como o imageio-ffmpeg não traz o ffprobe, vamos tentar forçar a leitura
-    # ou assumir que o ffmpeg consegue converter se passarmos os argumentos certos.
-    # Mas o erro anterior foi justamente falta de ffprobe.
-    
-    # Alternativa: Usar subprocesso direto com o ffmpeg do imageio se o pydub falhar,
-    # mas vamos tentar primeiro baixar um formato mais amigável (m4a/mp4) que o pydub
-    # talvez consiga ler sem ffprobe, ou tratar o erro.
-
     try:
         print(f"Acessando vídeo: {url}")
         yt = YouTube(url)
         print(f"Título: {yt.title}")
         
+        # --- Download Thumbnail ---
+        cover_path = os.path.join(output_folder, "cover.png")
+        try:
+            print(f"Baixando thumbnail: {yt.thumbnail_url}")
+            response = requests.get(yt.thumbnail_url)
+            img = Image.open(BytesIO(response.content))
+            # Resize to 256x256 as per Beat Saber standard (optional but good)
+            img = img.resize((256, 256))
+            img.save(cover_path)
+            print(f"Cover salvo: {cover_path}")
+        except Exception as e:
+            print(f"Erro ao baixar thumbnail: {e}")
+            cover_path = None
+
+        # --- Download Audio ---
         # Baixar apenas o stream de áudio (geralmente mp4/m4a ou webm)
-        # Vamos preferir m4a/mp4 que é mais comum
         stream = yt.streams.filter(only_audio=True, file_extension='mp4').first()
         
         if not stream:
@@ -44,7 +52,7 @@ def download_from_youtube(url, output_folder="data/input_music"):
 
         if not stream:
             print("Nenhum stream de áudio encontrado.")
-            return None
+            return None, None
 
         print("Baixando stream de áudio...")
         downloaded_file = stream.download(output_path=output_folder)
@@ -58,8 +66,6 @@ def download_from_youtube(url, output_folder="data/input_music"):
 
         print("Convertendo áudio...")
         
-        # Tentar carregar com pydub. Se falhar por falta de ffprobe,
-        # teremos que usar o ffmpeg via linha de comando (subprocess)
         try:
             audio = AudioSegment.from_file(downloaded_file)
             
@@ -69,11 +75,10 @@ def download_from_youtube(url, output_folder="data/input_music"):
             print(f"Salvando OGG (.egg): {ogg_filename}")
             audio.export(ogg_filename, format="ogg")
             
-            # Remover original
             os.remove(downloaded_file)
             print("Arquivo original removido.")
             
-            return mp3_filename
+            return mp3_filename, cover_path
             
         except Exception as e_pydub:
             print(f"Erro no pydub (provavelmente falta ffprobe): {e_pydub}")
@@ -98,16 +103,16 @@ def download_from_youtube(url, output_folder="data/input_music"):
             print(f"OGG salvo via ffmpeg: {ogg_filename}")
             
             os.remove(downloaded_file)
-            return mp3_filename
+            return mp3_filename, cover_path
 
     except Exception as e:
         print(f"Erro geral: {e}")
-        return None
+        return None, None
 
 if __name__ == "__main__":
     # Exemplo de uso
     url = input("Insira a URL do YouTube: ")
     if url:
-        path = download_from_youtube(url)
-        if path:
-            print(f"Processo concluído! Arquivo final: {path}")
+        mp3, cover = download_from_youtube(url)
+        if mp3:
+            print(f"Processo concluído! MP3: {mp3}, Cover: {cover}")
