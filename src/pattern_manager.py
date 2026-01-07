@@ -28,20 +28,43 @@ class PatternManager:
             2: ['stream_burst', 'tech_angle', 'double_down']
         }
 
-    def get_pattern(self, intensity, complexity_idx, vertical_idx, time_gap):
+    def get_pattern(self, intensity, complexity_idx, vertical_idx, time_gap, energy_level=0.5):
         """
-        Seleciona padrão baseado nas 3 cabeças da IA.
+        Seleciona padrão baseado nas 3 cabeças da IA e na ENERGIA GLOBAL.
         """
-        # Cooldown forçado para evitar spam impossível
-        if time_gap < 0.12: return None
+        # --- 1. Filtro de Energia (Global) ---
+        # Se a música está muito calma (energy < 0.3), forçamos padrões simples
+        # mesmo que a IA detecte batidas rápidas (pode ser hi-hats ou ruído)
+        if energy_level < 0.3:
+            complexity_idx = 0
+            # Aumenta o gap mínimo para "respirar"
+            if time_gap < 0.4: return None 
+
+        # Se a música está explodindo (energy > 0.8), permitimos caos
+        if energy_level > 0.8:
+            complexity_idx = max(1, complexity_idx) # Nunca Chill em clímax
+            
+        # --- 2. Cooldown Dinâmico ---
+        # Energia alta = cooldown menor (mais notas)
+        min_gap = 0.12
+        if energy_level > 0.7: min_gap = 0.10
+        if energy_level < 0.4: min_gap = 0.25
+        
+        if time_gap < min_gap: return None
         
         # Se o gap for muito pequeno, força stream independente da IA
-        if time_gap < 0.22:
+        # Mas só se a energia permitir!
+        if time_gap < 0.22 and energy_level > 0.5:
             return {'type': 'stream_burst', 'vert': vertical_idx}
             
         # Escolhe padrão baseado na complexidade predita pela IA
         options = self.patterns.get(complexity_idx, self.patterns[1])
-        chosen_type = random.choice(options)
+        
+        # Em alta energia, prefira padrões mais complexos da lista
+        if energy_level > 0.7 and len(options) > 1:
+            chosen_type = options[-1] # Pega o último (assumindo ordem de complexidade)
+        else:
+            chosen_type = random.choice(options)
         
         return {
             'type': chosen_type,

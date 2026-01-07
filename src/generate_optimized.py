@@ -6,7 +6,7 @@ import shutil
 from models_optimized import get_model
 from pattern_manager import PatternManager
 from flow_fixer import FlowFixer
-from audio_processor import extract_features, detect_bpm, add_silence
+from audio_processor import extract_features, detect_bpm, add_silence, analyze_energy
 
 def zip_folder(folder_path, output_path):
     if os.path.exists(output_path + ".zip"):
@@ -20,9 +20,20 @@ def generate_map_optimized(audio_path, output_folder):
     
     bpm = detect_bpm(audio_path)
     processed_audio = "song.egg"
-    add_silence(audio_path, os.path.join(output_folder, processed_audio))
+    full_audio_path = os.path.join(output_folder, processed_audio)
+    add_silence(audio_path, full_audio_path)
     
-    features, sr, hop_length = extract_features(os.path.join(output_folder, processed_audio), bpm)
+    features, sr, hop_length = extract_features(full_audio_path, bpm)
+    
+    # --- Análise de Energia (NOVO) ---
+    print("Analisando perfil de energia da música...")
+    energy_profile = analyze_energy(full_audio_path, hop_length=hop_length, sr=sr)
+    
+    # Ajuste de tamanho caso haja pequena discrepância de frames
+    if len(energy_profile) > len(features):
+        energy_profile = energy_profile[:len(features)]
+    elif len(energy_profile) < len(features):
+        energy_profile = np.pad(energy_profile, (0, len(features) - len(energy_profile)))
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = get_model().to(device)
@@ -48,23 +59,29 @@ def generate_map_optimized(audio_path, output_folder):
     frame_dur = hop_length / sr
     sec_per_beat = 60 / bpm
     
-    threshold = 0.5
+    base_threshold = 0.5
     cooldown = int(0.1 / frame_dur)
     last_frame = -cooldown
     
-    # --- REGRA DE OURO: TEMPO MÍNIMO DE INÍCIO ---
-    MIN_START_TIME = 3.0 # Segundos
-    # ---------------------------------------------
+    MIN_START_TIME = 3.0 
 
-    print("Gerando com Director AI...")
+    print("Gerando com Director AI (Energy Aware)...")
     
     for i in range(len(beat_probs)):
-        # Verifica tempo mínimo antes de qualquer coisa
         time_sec = i * frame_dur
         if time_sec < MIN_START_TIME:
             continue
+            
+        current_energy = energy_profile[i]
+        
+        # --- Threshold Dinâmico ---
+        # Energia baixa (0.2) -> Threshold sobe para 0.7 (Mais exigente)
+        # Energia alta (0.9) -> Threshold desce para 0.3 (Mais permissivo)
+        dynamic_threshold = base_threshold + (0.5 - current_energy) * 0.4
+        dynamic_threshold = np.clip(dynamic_threshold, 0.2, 0.85)
 
-        if beat_probs[i] > threshold and (i - last_frame) > cooldown:
+        if beat_probs[i] > dynamic_threshold and (i - last_frame) > cooldown:
+            # Peak picking local simples
             if i > 0 and i < len(beat_probs)-1:
                 if beat_probs[i] > beat_probs[i-1] and beat_probs[i] > beat_probs[i+1]:
                     
@@ -75,11 +92,13 @@ def generate_map_optimized(audio_path, output_folder):
                     intensity = beat_probs[i]
                     gap = (i - last_frame) * frame_dur
                     
-                    meta = pattern_manager.get_pattern(intensity, comp_idx, vert_idx, gap)
-                    new_notes = pattern_manager.apply_pattern(meta, beat_time, bpm)
+                    # Passa a energia para o PatternManager decidir o estilo
+                    meta = pattern_manager.get_pattern(intensity, comp_idx, vert_idx, gap, energy_level=current_energy)
                     
-                    raw_notes.extend(new_notes)
-                    last_frame = i
+                    if meta: # PatternManager pode recusar se o gap for pequeno e energia baixa
+                        new_notes = pattern_manager.apply_pattern(meta, beat_time, bpm)
+                        raw_notes.extend(new_notes)
+                        last_frame = i
     
     print("Aplicando FlowFixer (Simulação de Paridade e Resets)...")
     all_objects = FlowFixer.fix(raw_notes, bpm)
@@ -94,11 +113,9 @@ def save_beatmap(notes, bombs, bpm, folder, audio_name):
     notes.sort(key=lambda x: x['_time'])
     bombs.sort(key=lambda x: x['_time'])
     
-    # Remove duplicatas de bombas (caso o FlowFixer gere bombas sobrepostas para as duas mãos)
     unique_bombs = []
     seen_bombs = set()
     for b in bombs:
-        # Chave única: tempo + linha + layer
         key = (round(b['_time'], 3), b['_lineIndex'], b['_lineLayer'])
         if key not in seen_bombs:
             seen_bombs.add(key)
@@ -122,7 +139,7 @@ def save_beatmap(notes, bombs, bpm, folder, audio_name):
     info = {
         "_version": "2.1.0",
         "_songName": "AI Director Map",
-        "_songSubName": "FlowFixer V5",
+        "_songSubName": "Energy Aware V6",
         "_songAuthorName": "BSIAMapper",
         "_levelAuthorName": "AI",
         "_beatsPerMinute": float(bpm),

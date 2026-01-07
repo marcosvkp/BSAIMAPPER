@@ -55,6 +55,32 @@ def extract_features(file_path, bpm, sr=22050, n_mels=80, hop_length=512):
         print(f"Erro ao extrair features de {file_path}: {e}")
         return None, None, None
 
+def analyze_energy(file_path, hop_length=512, sr=22050):
+    """
+    Analisa a energia da música ao longo do tempo.
+    Retorna um array normalizado (0-1) com a mesma resolução temporal das features.
+    """
+    y, _ = librosa.load(file_path, sr=sr)
+    
+    # RMS (Root Mean Square) - Volume/Energia bruta
+    rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+    
+    # Spectral Flux (Onset Strength) - Mudanças súbitas (batidas)
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+    
+    # Combina e suaviza
+    combined = rms * 0.6 + onset_env * 0.4
+    
+    # Normalização local (para detectar picos relativos)
+    # Mas queremos normalização global para saber se a música está calma ou intensa no geral
+    norm_energy = (combined - np.min(combined)) / (np.max(combined) - np.min(combined) + 1e-6)
+    
+    # Suavização (Média móvel) para evitar picos muito rápidos que confundam a lógica de "seção"
+    window_size = int(sr / hop_length) # ~1 segundo
+    smoothed_energy = np.convolve(norm_energy, np.ones(window_size)/window_size, mode='same')
+    
+    return smoothed_energy
+
 def add_silence(file_path, output_path, silence_duration_ms=3000):
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     silence_sec = silence_duration_ms / 1000.0
