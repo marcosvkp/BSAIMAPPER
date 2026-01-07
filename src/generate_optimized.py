@@ -60,45 +60,64 @@ def generate_map_optimized(audio_path, output_folder):
     sec_per_beat = 60 / bpm
     
     base_threshold = 0.5
-    cooldown = int(0.1 / frame_dur)
-    last_frame = -cooldown
+    base_cooldown = int(0.1 / frame_dur)
+    last_frame = -base_cooldown
+    
+    # Controle de ocupação temporal (para bursts)
+    occupied_until_beat = 0.0
     
     MIN_START_TIME = 3.0 
 
-    print("Gerando com Director AI (Energy Aware)...")
+    print("Gerando com Director AI (Energy Aware + Burst Fill)...")
     
     for i in range(len(beat_probs)):
         time_sec = i * frame_dur
+        current_beat = time_sec / sec_per_beat
+        
         if time_sec < MIN_START_TIME:
+            continue
+            
+        # Se o tempo atual já está ocupado por um burst anterior, pula
+        if current_beat < occupied_until_beat:
             continue
             
         current_energy = energy_profile[i]
         
         # --- Threshold Dinâmico ---
-        # Energia baixa (0.2) -> Threshold sobe para 0.7 (Mais exigente)
-        # Energia alta (0.9) -> Threshold desce para 0.3 (Mais permissivo)
-        dynamic_threshold = base_threshold + (0.5 - current_energy) * 0.4
-        dynamic_threshold = np.clip(dynamic_threshold, 0.2, 0.85)
+        dynamic_threshold = base_threshold + (0.5 - current_energy) * 0.6
+        dynamic_threshold = np.clip(dynamic_threshold, 0.15, 0.85)
+        
+        # --- Cooldown Dinâmico ---
+        current_cooldown = base_cooldown
+        if current_energy > 0.75:
+            current_cooldown = int(base_cooldown * 0.6) 
 
-        if beat_probs[i] > dynamic_threshold and (i - last_frame) > cooldown:
+        if beat_probs[i] > dynamic_threshold and (i - last_frame) > current_cooldown:
             # Peak picking local simples
             if i > 0 and i < len(beat_probs)-1:
                 if beat_probs[i] > beat_probs[i-1] and beat_probs[i] > beat_probs[i+1]:
                     
-                    beat_time = round((time_sec / sec_per_beat) * 8) / 8
+                    beat_time = round(current_beat * 8) / 8
                     
                     comp_idx = comp_classes[i]
                     vert_idx = vert_classes[i]
                     intensity = beat_probs[i]
                     gap = (i - last_frame) * frame_dur
                     
-                    # Passa a energia para o PatternManager decidir o estilo
                     meta = pattern_manager.get_pattern(intensity, comp_idx, vert_idx, gap, energy_level=current_energy)
                     
-                    if meta: # PatternManager pode recusar se o gap for pequeno e energia baixa
+                    if meta: 
                         new_notes = pattern_manager.apply_pattern(meta, beat_time, bpm)
                         raw_notes.extend(new_notes)
                         last_frame = i
+                        
+                        # Se gerou um burst, atualiza o tempo ocupado
+                        if meta['type'] == 'burst_fill':
+                            # Burst ocupa 1 beat inteiro (4 notas de 1/4)
+                            occupied_until_beat = beat_time + 1.0
+                        elif meta['type'] == 'super_stream':
+                            # Super Stream ocupa 2 beats inteiros (8 notas de 1/4)
+                            occupied_until_beat = beat_time + 2.0
     
     print("Aplicando FlowFixer (Simulação de Paridade e Resets)...")
     all_objects = FlowFixer.fix(raw_notes, bpm)
