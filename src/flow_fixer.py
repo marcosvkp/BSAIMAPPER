@@ -70,6 +70,17 @@ class FlowFixer:
             curr_note = FlowFixer._sanitize_note(curr_note, hand_type)
             curr_cut = curr_note['_cutDirection']
             
+            # --- PROTEÇÃO DE STREAM (NOVO) ---
+            # Se as notas estão muito próximas (< 0.25s), confia no gerador.
+            # Streams rápidos geralmente já vêm com paridade correta (cima/baixo/cima/baixo).
+            if time_diff < 0.25:
+                processed.append(curr_note)
+                prev_note = curr_note
+                # Atualiza estado baseado no corte atual
+                if curr_cut in [0, 4, 5]: prev_ended_up = True
+                elif curr_cut in [1, 6, 7]: prev_ended_up = False
+                continue
+
             # Determina intenção atual
             curr_goes_up = False
             if curr_cut in [0, 4, 5]: curr_goes_up = True
