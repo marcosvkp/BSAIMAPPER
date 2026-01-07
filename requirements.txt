@@ -6,3 +6,4 @@ pandas
 requests
 pytubefix
 imageio-ffmpeg
+Pillow
