@@ -5,6 +5,7 @@ import os
 import shutil
 from models_optimized import get_model
 from pattern_manager import PatternManager
+from flow_fixer import FlowFixer
 from audio_processor import extract_features, detect_bpm, add_silence
 
 def zip_folder(folder_path, output_path):
@@ -26,7 +27,6 @@ def generate_map_optimized(audio_path, output_folder):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = get_model().to(device)
     
-    # Carrega modelo novo (DirectorNet)
     if os.path.exists("models/director_net.pth"):
         model.load_state_dict(torch.load("models/director_net.pth", map_location=device, weights_only=True))
     else:
@@ -37,19 +37,13 @@ def generate_map_optimized(audio_path, output_folder):
     
     inputs = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
     with torch.no_grad():
-        # Inferência Multi-Head
         p_beat, p_comp, p_vert = model(inputs)
-        
-        # Processa saídas
         beat_probs = torch.sigmoid(p_beat).squeeze().cpu().numpy()
-        
-        # Argmax para classificação (CORRIGIDO: dim=2 é a dimensão das classes)
-        # Shape original: (Batch, Time, Classes) -> Argmax(2) -> (Batch, Time)
         comp_classes = torch.argmax(p_comp, dim=2).squeeze().cpu().numpy()
         vert_classes = torch.argmax(p_vert, dim=2).squeeze().cpu().numpy()
         
     pattern_manager = PatternManager()
-    notes = []
+    raw_notes = []
     
     frame_dur = hop_length / sr
     sec_per_beat = 60 / bpm
@@ -58,45 +52,77 @@ def generate_map_optimized(audio_path, output_folder):
     cooldown = int(0.1 / frame_dur)
     last_frame = -cooldown
     
+    # --- REGRA DE OURO: TEMPO MÍNIMO DE INÍCIO ---
+    MIN_START_TIME = 3.0 # Segundos
+    # ---------------------------------------------
+
     print("Gerando com Director AI...")
     
     for i in range(len(beat_probs)):
+        # Verifica tempo mínimo antes de qualquer coisa
+        time_sec = i * frame_dur
+        if time_sec < MIN_START_TIME:
+            continue
+
         if beat_probs[i] > threshold and (i - last_frame) > cooldown:
             if i > 0 and i < len(beat_probs)-1:
                 if beat_probs[i] > beat_probs[i-1] and beat_probs[i] > beat_probs[i+1]:
-                    # Beat encontrado!
-                    time_sec = i * frame_dur
+                    
                     beat_time = round((time_sec / sec_per_beat) * 8) / 8
                     
-                    # Pega as decisões da IA para este frame
                     comp_idx = comp_classes[i]
                     vert_idx = vert_classes[i]
                     intensity = beat_probs[i]
                     gap = (i - last_frame) * frame_dur
                     
-                    # Solicita padrão ao Manager usando contexto da IA
                     meta = pattern_manager.get_pattern(intensity, comp_idx, vert_idx, gap)
                     new_notes = pattern_manager.apply_pattern(meta, beat_time, bpm)
                     
-                    notes.extend(new_notes)
+                    raw_notes.extend(new_notes)
                     last_frame = i
+    
+    print("Aplicando FlowFixer (Simulação de Paridade e Resets)...")
+    all_objects = FlowFixer.fix(raw_notes, bpm)
+    
+    final_notes = [obj for obj in all_objects if obj['_type'] != 3]
+    final_bombs = [obj for obj in all_objects if obj['_type'] == 3]
                     
-    save_beatmap(notes, bpm, output_folder, processed_audio)
+    save_beatmap(final_notes, final_bombs, bpm, output_folder, processed_audio)
     zip_folder(output_folder, os.path.join("output", os.path.basename(output_folder)))
 
-def save_beatmap(notes, bpm, folder, audio_name):
+def save_beatmap(notes, bombs, bpm, folder, audio_name):
     notes.sort(key=lambda x: x['_time'])
+    bombs.sort(key=lambda x: x['_time'])
+    
+    # Remove duplicatas de bombas (caso o FlowFixer gere bombas sobrepostas para as duas mãos)
+    unique_bombs = []
+    seen_bombs = set()
+    for b in bombs:
+        # Chave única: tempo + linha + layer
+        key = (round(b['_time'], 3), b['_lineIndex'], b['_lineLayer'])
+        if key not in seen_bombs:
+            seen_bombs.add(key)
+            unique_bombs.append(b)
+
+    all_notes_v2 = notes + unique_bombs
+    all_notes_v2.sort(key=lambda x: x['_time'])
+
     diff = {
         "_version": "2.0.0",
-        "_notes": notes,
+        "_notes": all_notes_v2,
         "_events": [],
         "_obstacles": [],
-        "_customData": {"_time": notes[-1]['_time'] + 4 if notes else 0}
+        "_customData": {
+            "_time": notes[-1]['_time'] + 4 if notes else 0,
+            "_BPMChanges": [],
+            "_bookmarks": []
+        }
     }
+    
     info = {
         "_version": "2.1.0",
         "_songName": "AI Director Map",
-        "_songSubName": "Multi-Head Model",
+        "_songSubName": "FlowFixer V5",
         "_songAuthorName": "BSIAMapper",
         "_levelAuthorName": "AI",
         "_beatsPerMinute": float(bpm),
@@ -108,7 +134,7 @@ def save_beatmap(notes, bpm, folder, audio_name):
                 "_difficulty": "ExpertPlus",
                 "_beatmapFilename": "ExpertPlus.dat",
                 "_noteJumpMovementSpeed": 18,
-                "_noteJumpStartBeatOffset": 0
+                "_noteJumpStartBeatOffset": -0.784
             }]
         }]
     }
