@@ -20,12 +20,13 @@ DIFFICULTY_MAP = {
 
 # Parâmetros de Geração por Dificuldade (Heurísticas)
 # NPS Alvo (Notas por Segundo) e Threshold Base
+# Ajustado: Thresholds reduzidos para garantir geração de notas em Easy/Normal
 DIFFICULTY_PARAMS = {
-    "Easy":       {"base_threshold": 0.75, "cooldown_mod": 2.0, "njs": 10, "offset": 0.0},
-    "Normal":     {"base_threshold": 0.65, "cooldown_mod": 1.5, "njs": 12, "offset": 0.0},
-    "Hard":       {"base_threshold": 0.55, "cooldown_mod": 1.2, "njs": 14, "offset": -0.2},
-    "Expert":     {"base_threshold": 0.45, "cooldown_mod": 1.0, "njs": 16, "offset": -0.4},
-    "ExpertPlus": {"base_threshold": 0.35, "cooldown_mod": 0.8, "njs": 18, "offset": -0.784}
+    "Easy":       {"base_threshold": 0.35, "cooldown_mod": 2.0, "njs": 10, "offset": 0.0},
+    "Normal":     {"base_threshold": 0.30, "cooldown_mod": 1.5, "njs": 12, "offset": 0.0},
+    "Hard":       {"base_threshold": 0.25, "cooldown_mod": 1.2, "njs": 14, "offset": -0.2},
+    "Expert":     {"base_threshold": 0.20, "cooldown_mod": 1.0, "njs": 16, "offset": -0.4},
+    "ExpertPlus": {"base_threshold": 0.15, "cooldown_mod": 0.8, "njs": 18, "offset": -0.784}
 }
 
 def zip_folder(folder_path, output_path):
@@ -46,10 +47,6 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
     
     # Instancia PatternManager com a dificuldade correta para filtrar padrões
     pattern_manager = PatternManager(difficulty=difficulty_name)
-    
-    # Inferência (já feita fora, mas precisamos processar os outputs)
-    # Para economizar VRAM/CPU, passamos os tensores já processados ou rodamos aqui se for rápido.
-    # Como o modelo é leve, vamos rodar a lógica de seleção aqui.
     
     device = next(model.parameters()).device
     inputs = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
@@ -79,9 +76,13 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
         current_energy = energy_profile[i]
         
         # Threshold Dinâmico ajustado pela dificuldade
-        # Easy/Normal: Menos sensível a energia baixa
-        dynamic_threshold = base_threshold + (0.5 - current_energy) * 0.6
-        dynamic_threshold = np.clip(dynamic_threshold, 0.15, 0.95)
+        # Reduzimos a influência da energia para dificuldades baixas para evitar "silêncio" em partes calmas
+        energy_influence = 0.6
+        if difficulty_name in ["Easy", "Normal"]:
+            energy_influence = 0.3
+
+        dynamic_threshold = base_threshold + (0.5 - current_energy) * energy_influence
+        dynamic_threshold = np.clip(dynamic_threshold, 0.10, 0.95)
         
         # Cooldown Dinâmico
         current_cooldown = base_cooldown
@@ -113,6 +114,9 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
 
     print(f"      Notas geradas (bruto): {len(raw_notes)}")
     
+    if len(raw_notes) == 0:
+        print(f"      AVISO: Nenhuma nota gerada para {difficulty_name}. Verifique os thresholds.")
+
     # FlowFixer
     all_objects = FlowFixer.fix(raw_notes, bpm)
     final_notes = [obj for obj in all_objects if obj['_type'] != 3]
