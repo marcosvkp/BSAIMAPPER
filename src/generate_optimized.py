@@ -5,6 +5,7 @@ import os
 import shutil
 from models_optimized import get_model
 from pattern_manager import PatternManager
+from flow_fixer import FlowFixer  # Importando o novo módulo
 from audio_processor import extract_features, detect_bpm, add_silence
 
 def zip_folder(folder_path, output_path):
@@ -26,7 +27,6 @@ def generate_map_optimized(audio_path, output_folder):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = get_model().to(device)
     
-    # Carrega modelo novo (DirectorNet)
     if os.path.exists("models/director_net.pth"):
         model.load_state_dict(torch.load("models/director_net.pth", map_location=device, weights_only=True))
     else:
@@ -37,14 +37,8 @@ def generate_map_optimized(audio_path, output_folder):
     
     inputs = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
     with torch.no_grad():
-        # Inferência Multi-Head
         p_beat, p_comp, p_vert = model(inputs)
-        
-        # Processa saídas
         beat_probs = torch.sigmoid(p_beat).squeeze().cpu().numpy()
-        
-        # Argmax para classificação (CORRIGIDO: dim=2 é a dimensão das classes)
-        # Shape original: (Batch, Time, Classes) -> Argmax(2) -> (Batch, Time)
         comp_classes = torch.argmax(p_comp, dim=2).squeeze().cpu().numpy()
         vert_classes = torch.argmax(p_vert, dim=2).squeeze().cpu().numpy()
         
@@ -64,22 +58,24 @@ def generate_map_optimized(audio_path, output_folder):
         if beat_probs[i] > threshold and (i - last_frame) > cooldown:
             if i > 0 and i < len(beat_probs)-1:
                 if beat_probs[i] > beat_probs[i-1] and beat_probs[i] > beat_probs[i+1]:
-                    # Beat encontrado!
                     time_sec = i * frame_dur
                     beat_time = round((time_sec / sec_per_beat) * 8) / 8
                     
-                    # Pega as decisões da IA para este frame
                     comp_idx = comp_classes[i]
                     vert_idx = vert_classes[i]
                     intensity = beat_probs[i]
                     gap = (i - last_frame) * frame_dur
                     
-                    # Solicita padrão ao Manager usando contexto da IA
                     meta = pattern_manager.get_pattern(intensity, comp_idx, vert_idx, gap)
                     new_notes = pattern_manager.apply_pattern(meta, beat_time, bpm)
                     
                     notes.extend(new_notes)
                     last_frame = i
+    
+    # --- ETAPA CRÍTICA: PÓS-PROCESSAMENTO DE FLOW ---
+    print("Aplicando FlowFixer (Correção de Física)...")
+    notes = FlowFixer.fix(notes, bpm)
+    # ------------------------------------------------
                     
     save_beatmap(notes, bpm, output_folder, processed_audio)
     zip_folder(output_folder, os.path.join("output", os.path.basename(output_folder)))
@@ -96,7 +92,7 @@ def save_beatmap(notes, bpm, folder, audio_name):
     info = {
         "_version": "2.1.0",
         "_songName": "AI Director Map",
-        "_songSubName": "Multi-Head Model",
+        "_songSubName": "FlowFixer Enhanced",
         "_songAuthorName": "BSIAMapper",
         "_levelAuthorName": "AI",
         "_beatsPerMinute": float(bpm),
