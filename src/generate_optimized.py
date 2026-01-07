@@ -5,7 +5,7 @@ import os
 import shutil
 from models_optimized import get_model
 from pattern_manager import PatternManager
-from flow_fixer import FlowFixer  # Importando o novo módulo
+from flow_fixer import FlowFixer
 from audio_processor import extract_features, detect_bpm, add_silence
 
 def zip_folder(folder_path, output_path):
@@ -39,11 +39,12 @@ def generate_map_optimized(audio_path, output_folder):
     with torch.no_grad():
         p_beat, p_comp, p_vert = model(inputs)
         beat_probs = torch.sigmoid(p_beat).squeeze().cpu().numpy()
+        # Correção do índice do argmax (dim=2)
         comp_classes = torch.argmax(p_comp, dim=2).squeeze().cpu().numpy()
         vert_classes = torch.argmax(p_vert, dim=2).squeeze().cpu().numpy()
         
     pattern_manager = PatternManager()
-    notes = []
+    raw_notes = []
     
     frame_dur = hop_length / sr
     sec_per_beat = 60 / bpm
@@ -69,30 +70,51 @@ def generate_map_optimized(audio_path, output_folder):
                     meta = pattern_manager.get_pattern(intensity, comp_idx, vert_idx, gap)
                     new_notes = pattern_manager.apply_pattern(meta, beat_time, bpm)
                     
-                    notes.extend(new_notes)
+                    raw_notes.extend(new_notes)
                     last_frame = i
     
-    # --- ETAPA CRÍTICA: PÓS-PROCESSAMENTO DE FLOW ---
-    print("Aplicando FlowFixer (Correção de Física)...")
-    notes = FlowFixer.fix(notes, bpm)
-    # ------------------------------------------------
+    # --- PÓS-PROCESSAMENTO DE FLOW E PARIDADE ---
+    print("Aplicando FlowFixer (Simulação de Paridade e Resets)...")
+    # O FlowFixer agora retorna uma lista mista de Notas e Bombas
+    all_objects = FlowFixer.fix(raw_notes, bpm)
+    
+    # Separar Notas e Bombas para o JSON
+    final_notes = [obj for obj in all_objects if obj['_type'] != 3]
+    final_bombs = [obj for obj in all_objects if obj['_type'] == 3]
+    # --------------------------------------------
                     
-    save_beatmap(notes, bpm, output_folder, processed_audio)
+    save_beatmap(final_notes, final_bombs, bpm, output_folder, processed_audio)
     zip_folder(output_folder, os.path.join("output", os.path.basename(output_folder)))
 
-def save_beatmap(notes, bpm, folder, audio_name):
+def save_beatmap(notes, bombs, bpm, folder, audio_name):
     notes.sort(key=lambda x: x['_time'])
+    bombs.sort(key=lambda x: x['_time'])
+    
     diff = {
         "_version": "2.0.0",
         "_notes": notes,
         "_events": [],
-        "_obstacles": [],
-        "_customData": {"_time": notes[-1]['_time'] + 4 if notes else 0}
+        "_obstacles": [], # Obstáculos podem ser adicionados futuramente
+        "_customData": {
+            "_time": notes[-1]['_time'] + 4 if notes else 0,
+            "_BPMChanges": [],
+            "_bookmarks": []
+        }
     }
+    
+    # Adiciona as bombas geradas pelo FlowFixer (se houver suporte no formato v2, bombas ficam em _notes com type 3)
+    # No formato V2 padrão, bombas são notas com type=3.
+    # O FlowFixer já gera com type=3, então podemos apenas juntar tudo em _notes se quisermos seguir estritamente V2.
+    # Mas para clareza, vamos garantir que o JSON final tenha tudo em _notes.
+    
+    all_notes_v2 = notes + bombs
+    all_notes_v2.sort(key=lambda x: x['_time'])
+    diff["_notes"] = all_notes_v2
+
     info = {
         "_version": "2.1.0",
         "_songName": "AI Director Map",
-        "_songSubName": "FlowFixer Enhanced",
+        "_songSubName": "Ranked Style Flow",
         "_songAuthorName": "BSIAMapper",
         "_levelAuthorName": "AI",
         "_beatsPerMinute": float(bpm),

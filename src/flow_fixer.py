@@ -2,11 +2,11 @@ import math
 
 class FlowFixer:
     """
-    Responsável por garantir a integridade física e o Flow do mapa.
-    Atua como um 'revisor' pós-geração.
+    Simulador de Paridade e Corretor de Flow.
+    Segue estritamente as regras de mapas Rankeados (ScoreSaber/BeatLeader).
     """
 
-    # Definição de direções
+    # Constantes de Direção (Beat Saber v2)
     UP = 0
     DOWN = 1
     LEFT = 2
@@ -17,102 +17,139 @@ class FlowFixer:
     DOWN_RIGHT = 7
     DOT = 8
 
+    # Constantes de Tipo
+    LEFT_HAND = 0
+    RIGHT_HAND = 1
+    BOMB = 3
+
     @staticmethod
     def fix(notes, bpm):
         """
-        Analisa e corrige a lista de notas para garantir flow contínuo.
+        Executa a revisão completa do mapa.
+        Retorna a lista de notas corrigida e com bombas adicionadas.
         """
         if not notes:
             return []
 
-        # Ordenar por tempo é crucial
+        # Ordenação temporal é obrigatória
         notes.sort(key=lambda x: x['_time'])
         
-        # Separar notas por mão para análise de física individual
-        left_hand_notes = [n for n in notes if n['_type'] == 0]
-        right_hand_notes = [n for n in notes if n['_type'] == 1]
-
-        # Corrigir cada mão individualmente
-        fixed_left = FlowFixer._process_hand(left_hand_notes, bpm, hand_type=0)
-        fixed_right = FlowFixer._process_hand(right_hand_notes, bpm, hand_type=1)
-
-        # Recombinar e reordenar
-        all_notes = fixed_left + fixed_right
-        all_notes.sort(key=lambda x: x['_time'])
+        # Separação por mão
+        left_notes = [n for n in notes if n['_type'] == FlowFixer.LEFT_HAND]
+        right_notes = [n for n in notes if n['_type'] == FlowFixer.RIGHT_HAND]
         
-        return all_notes
+        # Processamento individual (Paridade é calculada por mão)
+        fixed_left = FlowFixer._process_hand(left_notes, bpm, FlowFixer.LEFT_HAND)
+        fixed_right = FlowFixer._process_hand(right_notes, bpm, FlowFixer.RIGHT_HAND)
+        
+        # Recombinação
+        all_objects = fixed_left + fixed_right
+        all_objects.sort(key=lambda x: x['_time'])
+        
+        return all_objects
 
     @staticmethod
     def _process_hand(hand_notes, bpm, hand_type):
         if not hand_notes:
             return []
 
+        processed_objects = []
         seconds_per_beat = 60 / bpm
-        # Tempo mínimo para permitir um reset (ex: pausa para levantar o braço)
-        # 0.5s é um valor seguro para jogadores medianos/bons
-        reset_threshold_time = 0.4 
+        
+        # Limiar de Reset (Ranked Standard ~0.25s a 0.5s dependendo do BPM)
+        # Se o tempo for menor que isso, o movimento DEVE ser contínuo.
+        # Se for maior, pode haver reset (com bomba).
+        RESET_THRESHOLD = 0.35 
 
+        # Estado inicial: Assumimos que o braço começa neutro ou em baixo
+        # Vamos rastrear a "Intenção do Movimento Anterior"
+        # True = Movimento foi para CIMA (braço terminou em cima)
+        # False = Movimento foi para BAIXO (braço terminou em baixo)
+        prev_ended_up = False 
         prev_note = hand_notes[0]
+        processed_objects.append(prev_note)
+
+        # Determina estado inicial baseado na primeira nota
+        if prev_note['_cutDirection'] in [FlowFixer.UP, FlowFixer.UP_LEFT, FlowFixer.UP_RIGHT]:
+            prev_ended_up = True # Cortou pra cima, braço está em cima
         
         for i in range(1, len(hand_notes)):
             curr_note = hand_notes[i]
             
-            time_diff_beats = curr_note['_time'] - prev_note['_time']
-            time_diff_seconds = time_diff_beats * seconds_per_beat
+            time_diff = (curr_note['_time'] - prev_note['_time']) * seconds_per_beat
+            
+            # Análise da nota atual
+            curr_cut = curr_note['_cutDirection']
+            is_dot = curr_cut == FlowFixer.DOT
+            
+            # Determina a intenção da nota atual
+            # Se for DOT, tentamos inferir pela posição (Layer 2 = Cima, Layer 0 = Baixo)
+            curr_goes_up = False
+            if curr_cut in [FlowFixer.UP, FlowFixer.UP_LEFT, FlowFixer.UP_RIGHT]:
+                curr_goes_up = True
+            elif curr_cut in [FlowFixer.DOWN, FlowFixer.DOWN_LEFT, FlowFixer.DOWN_RIGHT]:
+                curr_goes_up = False
+            elif is_dot:
+                # Dot note: Se está na layer de cima, assume que o braço vai pra cima
+                curr_goes_up = curr_note['_lineLayer'] >= 1
+            else:
+                # Laterais (Left/Right) dependem do contexto, mas geralmente mantêm a altura
+                # Vamos assumir alternância simples se for lateral
+                curr_goes_up = not prev_ended_up
 
-            # Se for muito rápido, o flow TEM que ser contínuo
-            if time_diff_seconds < reset_threshold_time:
-                prev_cut = prev_note['_cutDirection']
-                curr_cut = curr_note['_cutDirection']
+            # --- DETECÇÃO DE QUEBRA DE FLOW (PARIDADE) ---
+            # Erro: Braço estava em cima (prev_ended_up) E tenta cortar pra cima de novo (curr_goes_up)
+            # Erro: Braço estava em baixo (not prev_ended_up) E tenta cortar pra baixo de novo (not curr_goes_up)
+            is_reset = (prev_ended_up and curr_goes_up) or (not prev_ended_up and not curr_goes_up)
 
-                # REGRA CRÍTICA: Verificar Resets Invisíveis
-                if FlowFixer._is_bad_flow(prev_cut, curr_cut):
-                    # Detectou problema! (Ex: Cima -> Cima)
+            if is_reset:
+                if time_diff < RESET_THRESHOLD:
+                    # CASO 1: Reset Invisível Rápido (PROIBIDO) -> Corrigir Nota
+                    # Solução: Inverter a direção para manter o flow contínuo
                     
-                    # Tenta corrigir invertendo a direção (Cima -> Baixo)
-                    new_cut = FlowFixer._get_inverse_cut(prev_cut)
+                    new_cut = FlowFixer._get_inverse_cut(curr_cut)
                     
-                    # Se a inversão criar um ângulo estranho (ex: cruzar braços), usa DOT
-                    if FlowFixer._is_awkward_angle(new_cut, curr_note['_lineIndex'], hand_type):
+                    # Verifica ergonomia da inversão
+                    if FlowFixer._is_bad_angle(new_cut, curr_note['_lineIndex'], hand_type):
                         curr_note['_cutDirection'] = FlowFixer.DOT
                     else:
                         curr_note['_cutDirection'] = new_cut
+                    
+                    # Atualiza o estado lógico (agora o flow foi corrigido)
+                    curr_goes_up = not prev_ended_up 
+
+                else:
+                    # CASO 2: Reset Lento (PERMITIDO COM SINALIZAÇÃO) -> Inserir Bomba
+                    # O jogador tem tempo de resetar, mas precisamos avisar.
+                    # Inserimos uma bomba na posição oposta para forçar o reset.
+                    
+                    bomb_layer = 2 if prev_ended_up else 0 # Se terminou em cima, bomba em cima pra forçar descer (sem cortar)
+                    bomb = {
+                        "_time": (prev_note['_time'] + curr_note['_time']) / 2,
+                        "_lineIndex": curr_note['_lineIndex'],
+                        "_lineLayer": bomb_layer,
+                        "_type": FlowFixer.BOMB,
+                        "_cutDirection": 0
+                    }
+                    processed_objects.append(bomb)
+                    
+                    # O reset é aceito, então o estado do braço "teletransporta" para a posição inicial do próximo corte
+                    # Se o próximo corte vai pra cima, o braço reseta pra baixo.
+                    pass 
+
+            # Adiciona a nota (possivelmente corrigida)
+            processed_objects.append(curr_note)
             
+            # Atualiza estado para a próxima iteração
             prev_note = curr_note
-            
-        return hand_notes
+            prev_ended_up = curr_goes_up
 
-    @staticmethod
-    def _is_bad_flow(prev, curr):
-        """
-        Retorna True se a transição quebra o flow (Reset Invisível).
-        Ex: Cima (0) seguido de Cima (0) ou Cima-Esq (4).
-        """
-        if prev == FlowFixer.DOT: return False # Dot reseta o flow suavemente
-        if curr == FlowFixer.DOT: return False
-
-        # Grupos de direção "Para Cima"
-        up_group = [FlowFixer.UP, FlowFixer.UP_LEFT, FlowFixer.UP_RIGHT]
-        # Grupos de direção "Para Baixo"
-        down_group = [FlowFixer.DOWN, FlowFixer.DOWN_LEFT, FlowFixer.DOWN_RIGHT]
-        # Grupos laterais
-        left_group = [FlowFixer.LEFT, FlowFixer.UP_LEFT, FlowFixer.DOWN_LEFT]
-        right_group = [FlowFixer.RIGHT, FlowFixer.UP_RIGHT, FlowFixer.DOWN_RIGHT]
-
-        # Regra: Se cortou pra cima, não pode cortar pra cima de novo
-        if prev in up_group and curr in up_group: return True
-        if prev in down_group and curr in down_group: return True
-        
-        # Regra: Se cortou pra esquerda, não pode cortar pra esquerda de novo (geralmente)
-        if prev in left_group and curr in left_group: return True
-        if prev in right_group and curr in right_group: return True
-
-        return False
+        return processed_objects
 
     @staticmethod
     def _get_inverse_cut(cut):
-        """Retorna a direção oposta natural."""
-        mapping = {
+        """Retorna a direção oposta para manter o flow."""
+        pairs = {
             FlowFixer.UP: FlowFixer.DOWN,
             FlowFixer.DOWN: FlowFixer.UP,
             FlowFixer.LEFT: FlowFixer.RIGHT,
@@ -120,26 +157,26 @@ class FlowFixer:
             FlowFixer.UP_LEFT: FlowFixer.DOWN_RIGHT,
             FlowFixer.UP_RIGHT: FlowFixer.DOWN_LEFT,
             FlowFixer.DOWN_LEFT: FlowFixer.UP_RIGHT,
-            FlowFixer.DOWN_RIGHT: FlowFixer.UP_LEFT,
-            FlowFixer.DOT: FlowFixer.DOT
+            FlowFixer.DOWN_RIGHT: FlowFixer.UP_LEFT
         }
-        return mapping.get(cut, FlowFixer.DOT)
+        return pairs.get(cut, FlowFixer.DOT)
 
     @staticmethod
-    def _is_awkward_angle(cut, line_index, hand):
+    def _is_bad_angle(cut, line, hand):
         """
-        Evita movimentos que torcem o pulso ou cruzam braços desnecessariamente.
+        Verifica se o ângulo é desconfortável (ex: torção de pulso).
+        Ranked maps evitam cortes 'para fora' nas extremidades opostas.
         """
-        # Mão Esquerda (0) na extrema direita (3) cortando pra esquerda (2) = OK
-        # Mão Esquerda (0) na extrema esquerda (0) cortando pra direita (3) = Ruim (pulso)
-        
-        if hand == 0: # Esquerda
-            # Evitar cortar para a direita se estiver muito na esquerda (rotação de pulso)
-            if line_index <= 1 and cut in [FlowFixer.RIGHT, FlowFixer.UP_RIGHT, FlowFixer.DOWN_RIGHT]:
+        # Mão Esquerda (0)
+        if hand == FlowFixer.LEFT_HAND:
+            # Na extrema esquerda (0), cortar para direita (3) é ruim
+            if line == 0 and cut in [FlowFixer.RIGHT, FlowFixer.UP_RIGHT, FlowFixer.DOWN_RIGHT]:
                 return True
-        else: # Direita
-            # Evitar cortar para a esquerda se estiver muito na direita
-            if line_index >= 2 and cut in [FlowFixer.LEFT, FlowFixer.UP_LEFT, FlowFixer.DOWN_LEFT]:
+        
+        # Mão Direita (1)
+        if hand == FlowFixer.RIGHT_HAND:
+            # Na extrema direita (3), cortar para esquerda (2) é ruim
+            if line == 3 and cut in [FlowFixer.LEFT, FlowFixer.UP_LEFT, FlowFixer.DOWN_LEFT]:
                 return True
                 
         return False
