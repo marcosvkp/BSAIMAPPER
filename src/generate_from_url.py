@@ -24,7 +24,7 @@ DIFFICULTY_PARAMS = {
     "Normal":     {"base_threshold": 0.30, "cooldown_mod": 1.5, "njs": 12, "offset": 0.0},
     "Hard":       {"base_threshold": 0.25, "cooldown_mod": 1.2, "njs": 14, "offset": -0.2},
     "Expert":     {"base_threshold": 0.20, "cooldown_mod": 1.0, "njs": 16, "offset": -0.4},
-    "ExpertPlus": {"base_threshold": 0.12, "cooldown_mod": 0.7, "njs": 18, "offset": -0.784} # Mais agressivo
+    "ExpertPlus": {"base_threshold": 0.12, "cooldown_mod": 0.7, "njs": 18, "offset": -0.784}
 }
 
 def zip_folder(folder_path, output_path):
@@ -63,7 +63,6 @@ def generate_difficulty(model, features, bpm, sr, hop_length, difficulty_name):
     occupied_until_beat = 0.0
     MIN_START_TIME = 3.0 
     
-    # Extrai perfis de energia (RMS e Onset) das features
     rms_profile = features[:, 82]
     onset_profile = features[:, 83]
     
@@ -74,7 +73,6 @@ def generate_difficulty(model, features, bpm, sr, hop_length, difficulty_name):
         if time_sec < MIN_START_TIME: continue
         if current_beat < occupied_until_beat: continue
             
-        # Combina RMS e Onset para uma métrica de energia geral
         current_energy = (rms_profile[i] * 0.7) + (onset_profile[i] * 0.3)
         
         energy_influence = 0.6
@@ -96,9 +94,9 @@ def generate_difficulty(model, features, bpm, sr, hop_length, difficulty_name):
                     comp_idx = comp_classes[i]
                     vert_idx = vert_classes[i]
                     intensity = beat_probs[i]
-                    gap = (i - last_frame) * frame_dur
+                    time_gap = (i - last_frame) * frame_dur
                     
-                    meta = pattern_manager.get_pattern(intensity, comp_idx, vert_idx, gap, energy_level=current_energy)
+                    meta = pattern_manager.get_pattern(intensity, comp_idx, vert_idx, time_gap, energy_level=current_energy)
                     
                     if meta: 
                         new_notes = pattern_manager.apply_pattern(meta, beat_time, bpm)
@@ -133,7 +131,6 @@ def generate_difficulty(model, features, bpm, sr, hop_length, difficulty_name):
     return final_notes, unique_bombs
 
 def create_info_dat(song_name, bpm, audio_filename, cover_filename, difficulties_data):
-    diff_sets = []
     beatmap_sets = []
     
     for diff_name in difficulties_data:
