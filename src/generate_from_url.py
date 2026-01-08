@@ -18,7 +18,7 @@ DIFFICULTY_MAP = {
     5: "ExpertPlus"
 }
 
-# Parâmetros de Geração por Dificuldade
+# Parâmetros de Geração por Dificuldade (Valores Padrão)
 DIFFICULTY_PARAMS = {
     "Easy":       {"base_threshold": 0.35, "cooldown_mod": 2.0, "njs": 10, "offset": 0.0},
     "Normal":     {"base_threshold": 0.30, "cooldown_mod": 1.5, "njs": 12, "offset": 0.0},
@@ -33,15 +33,14 @@ def zip_folder(folder_path, output_path):
     shutil.make_archive(output_path, 'zip', folder_path)
     print(f"Pacote final criado: {output_path}.zip")
 
-def generate_difficulty(model, features, bpm, sr, hop_length, difficulty_name):
+def generate_difficulty(model, features, bpm, sr, hop_length, difficulty_name, difficulty_params):
     """
-    Gera as notas para uma dificuldade específica usando o modelo carregado.
+    Gera as notas para uma dificuldade específica usando os parâmetros fornecidos.
     """
     print(f"   -> Gerando dificuldade: {difficulty_name}...")
     
-    params = DIFFICULTY_PARAMS[difficulty_name]
-    base_threshold = params["base_threshold"]
-    cooldown_modifier = params["cooldown_mod"]
+    base_threshold = difficulty_params["base_threshold"]
+    cooldown_modifier = difficulty_params["cooldown_mod"]
     
     pattern_manager = PatternManager(difficulty=difficulty_name)
     
@@ -94,9 +93,8 @@ def generate_difficulty(model, features, bpm, sr, hop_length, difficulty_name):
                     comp_idx = comp_classes[i]
                     vert_idx = vert_classes[i]
                     intensity = beat_probs[i]
-                    time_gap = (i - last_frame) * frame_dur
                     
-                    meta = pattern_manager.get_pattern(intensity, comp_idx, vert_idx, time_gap, energy_level=current_energy)
+                    meta = pattern_manager.get_pattern(intensity, comp_idx, vert_idx, (i - last_frame) * frame_dur, energy_level=current_energy)
                     
                     if meta: 
                         new_notes = pattern_manager.apply_pattern(meta, beat_time, bpm)
@@ -130,11 +128,13 @@ def generate_difficulty(model, features, bpm, sr, hop_length, difficulty_name):
             
     return final_notes, unique_bombs
 
-def create_info_dat(song_name, bpm, audio_filename, cover_filename, difficulties_data):
+def create_info_dat(song_name, bpm, audio_filename, cover_filename, custom_difficulty_params):
+    """
+    Gera o Info.dat contendo todas as dificuldades geradas com seus parâmetros customizados.
+    """
     beatmap_sets = []
     
-    for diff_name in difficulties_data:
-        params = DIFFICULTY_PARAMS[diff_name]
+    for diff_name, params in custom_difficulty_params.items():
         beatmap_sets.append({
             "_difficulty": diff_name,
             "_beatmapFilename": f"{diff_name}.dat",
@@ -200,13 +200,9 @@ def main():
     
     print("\n[2/5] Configuração de Dificuldades")
     print("Quais dificuldades deseja gerar?")
-    print("   1 = Easy")
-    print("   2 = Normal")
-    print("   3 = Hard")
-    print("   4 = Expert")
-    print("   5 = ExpertPlus")
+    print("   1 = Easy, 2 = Normal, 3 = Hard, 4 = Expert, 5 = ExpertPlus")
     
-    choices = input("\nExemplo: 1,3,5 -> ").strip()
+    choices = input("Exemplo: 1,3,5 -> ").strip()
     selected_diffs = []
     
     try:
@@ -225,8 +221,34 @@ def main():
     order = ["Easy", "Normal", "Hard", "Expert", "ExpertPlus"]
     selected_diffs.sort(key=lambda x: order.index(x))
     
-    print(f"Dificuldades selecionadas: {', '.join(selected_diffs)}")
-    
+    print(f"\nDificuldades selecionadas: {', '.join(selected_diffs)}")
+
+    # Coleta dos multiplicadores de dificuldade
+    custom_difficulty_params = {}
+    print("\n[3/5] Ajuste Fino da Dificuldade (1.0 = Padrão)")
+    for diff_name in selected_diffs:
+        while True:
+            try:
+                multiplier_str = input(f"   - Multiplicador para '{diff_name}': ").strip()
+                if not multiplier_str:
+                    multiplier = 1.0
+                else:
+                    multiplier = float(multiplier_str)
+                
+                if multiplier <= 0:
+                    print("      O multiplicador deve ser um número positivo. Tente novamente.")
+                    continue
+
+                # Copia os parâmetros base e aplica o multiplicador
+                new_params = DIFFICULTY_PARAMS[diff_name].copy()
+                new_params['base_threshold'] /= multiplier
+                new_params['cooldown_mod'] /= multiplier
+                
+                custom_difficulty_params[diff_name] = new_params
+                break 
+            except ValueError:
+                print("      Entrada inválida. Por favor, insira um número (ex: 1.0, 2.5, 0.7).")
+
     output_folder = os.path.join("output", song_name)
     if os.path.exists(output_folder):
         shutil.rmtree(output_folder)
@@ -235,7 +257,7 @@ def main():
     final_audio_name = "song.egg"
     final_cover_name = "cover.png"
     
-    print("\n[3/5] Analisando áudio e extraindo features...")
+    print("\n[4/5] Analisando áudio e extraindo features...")
     bpm = detect_bpm(mp3_path)
     print(f"BPM Detectado: {bpm}")
     
@@ -260,20 +282,17 @@ def main():
         print("ERRO: Modelo 'models/director_net.pth' não encontrado.")
         return
 
-    print("\n[4/5] Gerando mapas...")
+    print("\n[5/5] Gerando mapas...")
     
-    generated_data = {}
-    
-    for diff in selected_diffs:
-        notes, bombs = generate_difficulty(model, features, bpm, sr, hop_length, diff)
-        generated_data[diff] = (notes, bombs)
-        save_difficulty_dat(notes, bombs, output_folder, f"{diff}.dat")
+    for diff_name, diff_params in custom_difficulty_params.items():
+        notes, bombs = generate_difficulty(model, features, bpm, sr, hop_length, diff_name, diff_params)
+        save_difficulty_dat(notes, bombs, output_folder, f"{diff_name}.dat")
         
-    info_content = create_info_dat(song_name, bpm, final_audio_name, final_cover_name, selected_diffs)
+    info_content = create_info_dat(song_name, bpm, final_audio_name, final_cover_name, custom_difficulty_params)
     with open(os.path.join(output_folder, "Info.dat"), 'w') as f:
         json.dump(info_content, f, indent=2)
         
-    print("\n[5/5] Finalizando...")
+    print("\n[6/6] Finalizando...")
     zip_folder(output_folder, os.path.join("output", song_name))
     
     try:
