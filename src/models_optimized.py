@@ -5,7 +5,7 @@ class DirectorNet(nn.Module):
     """
     Modelo 'Diretor': Não apenas detecta beats, mas dirige o estilo.
     """
-    def __init__(self, input_size=82, hidden_size=128):
+    def __init__(self, input_size=84, hidden_size=128): # Aumentado de 82 para 84
         super(DirectorNet, self).__init__()
         
         # --- Backbone (Compartilhado) ---

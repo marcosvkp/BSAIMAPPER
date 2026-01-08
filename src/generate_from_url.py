@@ -7,7 +7,7 @@ from youtube_downloader import download_from_youtube
 from models_optimized import get_model
 from pattern_manager import PatternManager
 from flow_fixer import FlowFixer
-from audio_processor import extract_features, detect_bpm, add_silence, analyze_energy
+from audio_processor import extract_features, detect_bpm, add_silence
 
 # Mapeamento de IDs para Nomes de Dificuldade
 DIFFICULTY_MAP = {
@@ -18,15 +18,13 @@ DIFFICULTY_MAP = {
     5: "ExpertPlus"
 }
 
-# Parâmetros de Geração por Dificuldade (Heurísticas)
-# NPS Alvo (Notas por Segundo) e Threshold Base
-# Ajustado: Thresholds reduzidos para garantir geração de notas em Easy/Normal
+# Parâmetros de Geração por Dificuldade
 DIFFICULTY_PARAMS = {
     "Easy":       {"base_threshold": 0.35, "cooldown_mod": 2.0, "njs": 10, "offset": 0.0},
     "Normal":     {"base_threshold": 0.30, "cooldown_mod": 1.5, "njs": 12, "offset": 0.0},
     "Hard":       {"base_threshold": 0.25, "cooldown_mod": 1.2, "njs": 14, "offset": -0.2},
     "Expert":     {"base_threshold": 0.20, "cooldown_mod": 1.0, "njs": 16, "offset": -0.4},
-    "ExpertPlus": {"base_threshold": 0.15, "cooldown_mod": 0.8, "njs": 18, "offset": -0.784}
+    "ExpertPlus": {"base_threshold": 0.12, "cooldown_mod": 0.7, "njs": 18, "offset": -0.784} # Mais agressivo
 }
 
 def zip_folder(folder_path, output_path):
@@ -35,7 +33,7 @@ def zip_folder(folder_path, output_path):
     shutil.make_archive(output_path, 'zip', folder_path)
     print(f"Pacote final criado: {output_path}.zip")
 
-def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, difficulty_name):
+def generate_difficulty(model, features, bpm, sr, hop_length, difficulty_name):
     """
     Gera as notas para uma dificuldade específica usando o modelo carregado.
     """
@@ -45,7 +43,6 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
     base_threshold = params["base_threshold"]
     cooldown_modifier = params["cooldown_mod"]
     
-    # Instancia PatternManager com a dificuldade correta para filtrar padrões
     pattern_manager = PatternManager(difficulty=difficulty_name)
     
     device = next(model.parameters()).device
@@ -66,6 +63,10 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
     occupied_until_beat = 0.0
     MIN_START_TIME = 3.0 
     
+    # Extrai perfis de energia (RMS e Onset) das features
+    rms_profile = features[:, 82]
+    onset_profile = features[:, 83]
+    
     for i in range(len(beat_probs)):
         time_sec = i * frame_dur
         current_beat = time_sec / sec_per_beat
@@ -73,10 +74,9 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
         if time_sec < MIN_START_TIME: continue
         if current_beat < occupied_until_beat: continue
             
-        current_energy = energy_profile[i]
+        # Combina RMS e Onset para uma métrica de energia geral
+        current_energy = (rms_profile[i] * 0.7) + (onset_profile[i] * 0.3)
         
-        # Threshold Dinâmico ajustado pela dificuldade
-        # Reduzimos a influência da energia para dificuldades baixas para evitar "silêncio" em partes calmas
         energy_influence = 0.6
         if difficulty_name in ["Easy", "Normal"]:
             energy_influence = 0.3
@@ -84,13 +84,11 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
         dynamic_threshold = base_threshold + (0.5 - current_energy) * energy_influence
         dynamic_threshold = np.clip(dynamic_threshold, 0.10, 0.95)
         
-        # Cooldown Dinâmico
         current_cooldown = base_cooldown
         if current_energy > 0.75:
             current_cooldown = int(base_cooldown * 0.6)
 
         if beat_probs[i] > dynamic_threshold and (i - last_frame) > current_cooldown:
-            # Peak picking
             if i > 0 and i < len(beat_probs)-1:
                 if beat_probs[i] > beat_probs[i-1] and beat_probs[i] > beat_probs[i+1]:
                     
@@ -117,16 +115,13 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
     if len(raw_notes) == 0:
         print(f"      AVISO: Nenhuma nota gerada para {difficulty_name}. Verifique os thresholds.")
 
-    # FlowFixer
     all_objects = FlowFixer.fix(raw_notes, bpm)
     final_notes = [obj for obj in all_objects if obj['_type'] != 3]
     final_bombs = [obj for obj in all_objects if obj['_type'] == 3]
     
-    # Ordenar
     final_notes.sort(key=lambda x: x['_time'])
     final_bombs.sort(key=lambda x: x['_time'])
     
-    # Remover bombas duplicadas
     unique_bombs = []
     seen_bombs = set()
     for b in final_bombs:
@@ -138,11 +133,7 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
     return final_notes, unique_bombs
 
 def create_info_dat(song_name, bpm, audio_filename, cover_filename, difficulties_data):
-    """
-    Gera o Info.dat contendo todas as dificuldades geradas.
-    """
     diff_sets = []
-    
     beatmap_sets = []
     
     for diff_name in difficulties_data:
@@ -196,13 +187,11 @@ def main():
     print("   BEAT SABER AI MAPPER - PIPELINE COMPLETA")
     print("==================================================")
     
-    # 1. URL
     url = input("Digite a URL da música (YouTube): ").strip()
     if not url:
         print("URL inválida.")
         return
 
-    # 2. Download
     print("\n[1/5] Baixando e processando áudio...")
     mp3_path, cover_path = download_from_youtube(url, output_folder="data/temp_download")
     
@@ -212,7 +201,6 @@ def main():
         
     song_name = os.path.splitext(os.path.basename(mp3_path))[0]
     
-    # 3. Escolha de Dificuldades
     print("\n[2/5] Configuração de Dificuldades")
     print("Quais dificuldades deseja gerar?")
     print("   1 = Easy")
@@ -237,23 +225,19 @@ def main():
     if not selected_diffs:
         selected_diffs = ["Expert"]
         
-    # Ordenar por dificuldade (Easy -> ExpertPlus)
     order = ["Easy", "Normal", "Hard", "Expert", "ExpertPlus"]
     selected_diffs.sort(key=lambda x: order.index(x))
     
     print(f"Dificuldades selecionadas: {', '.join(selected_diffs)}")
     
-    # 4. Preparação do Output
     output_folder = os.path.join("output", song_name)
     if os.path.exists(output_folder):
         shutil.rmtree(output_folder)
     os.makedirs(output_folder)
     
-    # Mover/Copiar arquivos base
     final_audio_name = "song.egg"
     final_cover_name = "cover.png"
     
-    # Processar áudio (silêncio)
     print("\n[3/5] Analisando áudio e extraindo features...")
     bpm = detect_bpm(mp3_path)
     print(f"BPM Detectado: {bpm}")
@@ -264,22 +248,12 @@ def main():
     if cover_path and os.path.exists(cover_path):
         shutil.copy(cover_path, os.path.join(output_folder, final_cover_name))
     else:
-        # Criar cover dummy se não existir
         from PIL import Image
         img = Image.new('RGB', (256, 256), color = (73, 109, 137))
         img.save(os.path.join(output_folder, final_cover_name))
 
-    # Extrair Features
     features, sr, hop_length = extract_features(full_audio_path, bpm)
-    energy_profile = analyze_energy(full_audio_path, hop_length=hop_length, sr=sr)
-    
-    # Ajuste de tamanho
-    if len(energy_profile) > len(features):
-        energy_profile = energy_profile[:len(features)]
-    elif len(energy_profile) < len(features):
-        energy_profile = np.pad(energy_profile, (0, len(features) - len(energy_profile)))
 
-    # Carregar Modelo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = get_model().to(device)
     if os.path.exists("models/director_net.pth"):
@@ -289,26 +263,22 @@ def main():
         print("ERRO: Modelo 'models/director_net.pth' não encontrado.")
         return
 
-    # 5. Geração Loop
     print("\n[4/5] Gerando mapas...")
     
-    generated_data = {} # diff_name -> (notes, bombs)
+    generated_data = {}
     
     for diff in selected_diffs:
-        notes, bombs = generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, diff)
+        notes, bombs = generate_difficulty(model, features, bpm, sr, hop_length, diff)
         generated_data[diff] = (notes, bombs)
         save_difficulty_dat(notes, bombs, output_folder, f"{diff}.dat")
         
-    # Criar Info.dat
     info_content = create_info_dat(song_name, bpm, final_audio_name, final_cover_name, selected_diffs)
     with open(os.path.join(output_folder, "Info.dat"), 'w') as f:
         json.dump(info_content, f, indent=2)
         
-    # 6. Empacotar
     print("\n[5/5] Finalizando...")
     zip_folder(output_folder, os.path.join("output", song_name))
     
-    # Limpeza
     try:
         shutil.rmtree("data/temp_download")
     except:
