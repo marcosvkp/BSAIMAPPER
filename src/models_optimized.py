@@ -9,7 +9,6 @@ class DirectorNet(nn.Module):
         super(DirectorNet, self).__init__()
         
         # --- Backbone (Compartilhado) ---
-        # Extrai características musicais brutas
         self.conv1 = nn.Conv1d(input_size, 64, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm1d(64)
         self.relu = nn.ReLU()
@@ -23,15 +22,12 @@ class DirectorNet(nn.Module):
         # --- Heads (Especialistas) ---
         
         # Head 1: Beat Detection (Quando bater?)
-        # Saída: Probabilidade (0-1)
         self.fc_beat = nn.Linear(hidden_size * 2, 1)
         
         # Head 2: Complexity Control (Qual padrão usar?)
-        # Saída: 3 Classes (0: Chill, 1: Dance, 2: Tech/Stream)
         self.fc_complexity = nn.Linear(hidden_size * 2, 3)
         
         # Head 3: Vertical Bias (Onde focar?)
-        # Saída: 3 Classes (0: Baixo, 1: Meio, 2: Cima)
         self.fc_vertical = nn.Linear(hidden_size * 2, 3)
         
     def forward(self, x):

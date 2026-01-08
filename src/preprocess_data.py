@@ -16,10 +16,8 @@ def calculate_metadata(targets, window=200):
     num_frames = targets.shape[0]
     metadata = np.zeros((num_frames, 2), dtype=np.float32)
     
-    # Auxiliar: Onde tem nota?
     has_note = np.any(targets > 0.1, axis=1)
     
-    # Otimização: Calcular em passos de 10 frames e preencher (suficiente para contexto)
     step = 10
     half_window = window // 2
     
@@ -27,31 +25,25 @@ def calculate_metadata(targets, window=200):
         start = max(0, i - half_window)
         end = min(num_frames, i + half_window)
         
-        # --- 1. Complexidade (Densidade Local) ---
         chunk_notes = has_note[start:end]
         if len(chunk_notes) == 0:
             density = 0
         else:
             density = np.sum(chunk_notes) / len(chunk_notes)
             
-        # Limiares empíricos baseados em mapas Expert+
         if density > 0.15: comp_val = 2.0 # Alta/Tech/Stream
         elif density > 0.05: comp_val = 1.0 # Média/Dance
         else: comp_val = 0.0 # Baixa/Chill
         
-        # --- 2. Verticalidade (Altura Média Ponderada) ---
         chunk_targets = targets[start:end]
-        # Somar ativações por layer
         l0 = np.sum(chunk_targets[:, 0:4]) # Layer 0 (Baixo)
         l1 = np.sum(chunk_targets[:, 4:8]) # Layer 1 (Meio)
         l2 = np.sum(chunk_targets[:, 8:12]) # Layer 2 (Cima)
         total = l0 + l1 + l2 + 1e-6
         
-        # Média ponderada (0, 1, 2)
         avg_height = (0*l0 + 1*l1 + 2*l2) / total
         vert_val = round(avg_height)
         
-        # Preencher o bloco atual com os valores calculados
         fill_end = min(num_frames, i + step)
         metadata[i:fill_end, 0] = comp_val
         metadata[i:fill_end, 1] = vert_val
@@ -64,7 +56,6 @@ def process_map(map_folder, processed_dir):
     save_path_y = os.path.join(processed_dir, f"{map_id}_y.npy")
     save_path_meta = os.path.join(processed_dir, f"{map_id}_meta.npy")
 
-    # Se já existe tudo (incluindo meta), pula
     if os.path.exists(save_path_x) and os.path.exists(save_path_y) and os.path.exists(save_path_meta):
         return None, map_id, "already_processed"
 
@@ -75,7 +66,6 @@ def process_map(map_folder, processed_dir):
             
         features, targets, vertical_dist = data
         
-        # Calcular Metadados (Novidade V5)
         metadata = calculate_metadata(targets)
         
         np.save(save_path_x, features)
@@ -117,5 +107,4 @@ def preprocess_all(raw_dir="data/raw_maps", processed_dir="data/processed", max_
     print(f"\nConcluído! {processed_count} mapas processados em {processed_dir}")
 
 if __name__ == "__main__":
-    # Ajuste max_workers conforme sua CPU
     preprocess_all(max_workers=os.cpu_count() or 4)

@@ -8,7 +8,7 @@ from models_optimized import get_model
 
 BATCH_SIZE = 64
 SEQ_LEN = 200
-EPOCHS = 25 # Um pouco mais pois a tarefa é mais complexa
+EPOCHS = 25
 LEARNING_RATE = 0.0008
 
 class DirectorDataset(Dataset):
@@ -25,7 +25,6 @@ class DirectorDataset(Dataset):
         file_x = self.files[file_idx]
         file_y = file_x.replace('_x.npy', '_y.npy')
         
-        # Carrega features e targets
         features = np.load(os.path.join(self.processed_dir, file_x), mmap_mode='r')
         targets = np.load(os.path.join(self.processed_dir, file_y), mmap_mode='r')
         
@@ -36,19 +35,14 @@ class DirectorDataset(Dataset):
         feat_crop = np.array(features[start:end])
         targ_crop = np.array(targets[start:end])
         
-        # --- Engenharia de Targets On-the-Fly ---
-        # 1. Beat (Binário)
         beat_target = np.any(targ_crop > 0.1, axis=1).astype(np.float32).reshape(-1, 1)
         
-        # 2. Complexidade (Baseada na densidade da janela atual)
         density = np.mean(beat_target)
         if density > 0.15: comp_val = 2 # Tech/Stream
         elif density > 0.05: comp_val = 1 # Dance
         else: comp_val = 0 # Chill
-        # Expande para o tamanho da sequencia (simplificação: mesma classe pra janela toda)
         comp_target = np.full((self.seq_len,), comp_val, dtype=np.longlong)
         
-        # 3. Verticalidade (Média ponderada)
         l0 = np.sum(targ_crop[:, 0:4])
         l1 = np.sum(targ_crop[:, 4:8])
         l2 = np.sum(targ_crop[:, 8:12])
@@ -57,12 +51,10 @@ class DirectorDataset(Dataset):
         vert_val = int(round(avg_h))
         vert_target = np.full((self.seq_len,), vert_val, dtype=np.longlong)
         
-        # Padding
         if feat_crop.shape[0] < self.seq_len:
             pad = self.seq_len - feat_crop.shape[0]
             feat_crop = np.pad(feat_crop, ((0, pad), (0, 0)))
             beat_target = np.pad(beat_target, ((0, pad), (0, 0)))
-            # Para classificação, padding ignora no loss (usualmente -100)
             comp_target = np.pad(comp_target, (0, pad), constant_values=0)
             vert_target = np.pad(vert_target, (0, pad), constant_values=0)
 
@@ -79,7 +71,6 @@ def train():
     model = get_model().to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
-    # Losses
     crit_beat = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([8.0]).to(device))
     crit_class = nn.CrossEntropyLoss()
     
@@ -95,7 +86,6 @@ def train():
             optimizer.zero_grad()
             p_beat, p_comp, p_vert = model(feats)
             
-            # Reshape para CrossEntropy: (Batch, Classes, Seq) vs (Batch, Seq)
             p_comp = p_comp.permute(0, 2, 1) 
             p_vert = p_vert.permute(0, 2, 1)
             
@@ -103,7 +93,6 @@ def train():
             loss_c = crit_class(p_comp, t_comp)
             loss_v = crit_class(p_vert, t_vert)
             
-            # Soma ponderada das perdas
             loss = loss_b + 0.5 * loss_c + 0.5 * loss_v
             
             loss.backward()

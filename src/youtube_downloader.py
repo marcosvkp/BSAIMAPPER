@@ -20,7 +20,6 @@ def download_from_youtube(url, output_folder="data/input_music"):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
-    # Configurar pydub para usar o ffmpeg do imageio-ffmpeg
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     AudioSegment.converter = ffmpeg_path
     
@@ -29,13 +28,11 @@ def download_from_youtube(url, output_folder="data/input_music"):
         yt = YouTube(url)
         print(f"Título: {yt.title}")
         
-        # --- Download Thumbnail ---
         cover_path = os.path.join(output_folder, "cover.png")
         try:
             print(f"Baixando thumbnail: {yt.thumbnail_url}")
             response = requests.get(yt.thumbnail_url)
             img = Image.open(BytesIO(response.content))
-            # Resize to 256x256 as per Beat Saber standard (optional but good)
             img = img.resize((256, 256))
             img.save(cover_path)
             print(f"Cover salvo: {cover_path}")
@@ -43,8 +40,6 @@ def download_from_youtube(url, output_folder="data/input_music"):
             print(f"Erro ao baixar thumbnail: {e}")
             cover_path = None
 
-        # --- Download Audio ---
-        # Baixar apenas o stream de áudio (geralmente mp4/m4a ou webm)
         stream = yt.streams.filter(only_audio=True, file_extension='mp4').first()
         
         if not stream:
@@ -59,7 +54,6 @@ def download_from_youtube(url, output_folder="data/input_music"):
         downloaded_file = os.path.abspath(downloaded_file)
         print(f"Arquivo original baixado: {downloaded_file}")
 
-        # Conversão
         base_name = os.path.splitext(downloaded_file)[0]
         mp3_filename = base_name + ".mp3"
         ogg_filename = base_name + ".egg"
@@ -86,7 +80,6 @@ def download_from_youtube(url, output_folder="data/input_music"):
             
             import subprocess
             
-            # Converter para MP3 via subprocesso
             cmd_mp3 = [
                 ffmpeg_path, '-y', '-i', downloaded_file, 
                 '-vn', '-ar', '44100', '-ac', '2', '-b:a', '192k', mp3_filename
@@ -94,7 +87,6 @@ def download_from_youtube(url, output_folder="data/input_music"):
             subprocess.run(cmd_mp3, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             print(f"MP3 salvo via ffmpeg: {mp3_filename}")
 
-            # Converter para OGG via subprocesso
             cmd_ogg = [
                 ffmpeg_path, '-y', '-i', downloaded_file,
                 '-vn', '-acodec', 'libvorbis', ogg_filename
@@ -110,7 +102,6 @@ def download_from_youtube(url, output_folder="data/input_music"):
         return None, None
 
 if __name__ == "__main__":
-    # Exemplo de uso
     url = input("Insira a URL do YouTube: ")
     if url:
         mp3, cover = download_from_youtube(url)

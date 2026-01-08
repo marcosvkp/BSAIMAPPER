@@ -8,7 +8,6 @@ def download_map(doc, output_dir):
     map_id = doc['id']
     map_name = doc['name']
     
-    # Verifica se já existe
     if os.path.exists(os.path.join(output_dir, map_id)):
         return f"Pulado (já existe): {map_name}"
 
@@ -33,9 +32,6 @@ def download_ranked_maps(output_dir="data/raw_maps", limit=300):
         os.makedirs(output_dir)
 
     print(f"Buscando lista de {limit} mapas rankeados...")
-    # BeatSaver API page size is usually 20. We might need multiple requests if limit > 20.
-    # Mas para simplificar, vamos pegar os 'sortOrder=Relevance' que a API entregar.
-    # A API do BeatSaver permite search?q=&ranked=true
     
     maps_to_download = []
     page = 0

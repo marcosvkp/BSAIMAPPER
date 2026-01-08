@@ -40,7 +40,6 @@ class PatternManager:
         if self.difficulty == "Easy":
             max_complexity = 0
             allow_bursts = False
-            # Força gap mínimo maior para Easy
             if time_gap < 0.5: return None
             
         elif self.difficulty == "Normal":
@@ -49,18 +48,15 @@ class PatternManager:
             if time_gap < 0.3: return None
             
         elif self.difficulty == "Hard":
-            max_complexity = 1 # Maioria Dance/Chill
-            # Permite alguns Tech simples se energia for alta, mas sem bursts loucos
+            max_complexity = 1
             if energy_level > 0.8: max_complexity = 2
             allow_bursts = False
             if time_gap < 0.2: return None
             
         elif self.difficulty == "Expert":
             max_complexity = 2
-            allow_bursts = True # Mas controlado
+            allow_bursts = True
             
-        # ExpertPlus é o padrão sem restrições (max_complexity=2, allow_bursts=True)
-
         # --- 1. Filtro de Energia (Global) ---
         if energy_level < 0.3:
             complexity_idx = 0
@@ -75,33 +71,28 @@ class PatternManager:
         if energy_level > 0.7: min_gap = 0.08
         if energy_level < 0.4: min_gap = 0.25
         
-        # Sobrescreve min_gap se a dificuldade exigir mais espaço (já tratado acima, mas reforçando)
         if self.difficulty == "Easy": min_gap = 0.5
         if self.difficulty == "Normal": min_gap = 0.3
         if self.difficulty == "Hard": min_gap = 0.2
         
         if time_gap < min_gap: return None
         
-        # Se o gap for muito pequeno, força stream independente da IA (Apenas Expert/ExpertPlus)
         if self.difficulty in ["Expert", "ExpertPlus"]:
             if time_gap < 0.22 and energy_level > 0.5:
                 return {'type': 'stream_burst', 'vert': vertical_idx}
             
         options = self.patterns.get(complexity_idx, self.patterns[1])
         
-        # Filtrar padrões muito complexos se estivermos limitando (ex: Hard não deve ter super_stream)
         if not allow_bursts:
             options = [p for p in options if p not in ['burst_fill', 'super_stream', 'stream_burst']]
-            if not options: options = self.patterns[0] # Fallback para Chill
+            if not options: options = self.patterns[0]
 
         # --- Lógica de Drop Agressiva ---
         if allow_bursts:
-            # Se a energia for muito alta (> 0.85), chance de SUPER STREAM (8 notas)
             if energy_level > 0.85:
-                if random.random() < 0.3: # 30% de chance de iniciar um stream longo
+                if random.random() < 0.3:
                     return {'type': 'super_stream', 'vert': vertical_idx, 'intensity': intensity}
             
-            # Se a energia for alta (> 0.65), chance de BURST FILL (4 notas)
             if energy_level > 0.65:
                 burst_prob = 0.2 + (energy_level - 0.65) * 1.3
                 if random.random() < burst_prob:
@@ -128,48 +119,32 @@ class PatternManager:
         
         if ptype == 'single_flow':
             notes = self._gen_flow(time, vert_bias)
-            
         elif ptype == 'wide_flow':
             notes = self._gen_wide(time, vert_bias)
-            
         elif ptype == 'stack_simple':
-             # Adicionando implementação simples de stack se faltar, ou usando flow
              notes = self._gen_flow(time, vert_bias)
-
         elif ptype == 'diagonal_cross':
-             notes = self._gen_wide(time, vert_bias) # Reutilizando wide por enquanto
-
+             notes = self._gen_wide(time, vert_bias)
         elif ptype == 'window_wipe':
-             notes = self._gen_wide(time, vert_bias) # Reutilizando wide por enquanto
-
+             notes = self._gen_wide(time, vert_bias)
         elif ptype == 'stream_burst':
             notes = self._gen_flow(time, vert_bias, force_inversion=True)
-            
         elif ptype == 'double_down':
             notes = self._gen_double(time, vert_bias)
-            
         elif ptype == 'tech_angle':
             notes = self._gen_tech(time, vert_bias)
-            
         elif ptype == 'tower_stack':
             notes = self._gen_tower(time, vert_bias)
-            
         elif ptype == 'burst_fill':
-            # Gera 4 notas em 1/4 de beat (Stream curto)
             notes = self._gen_burst(time, bpm, vert_bias, length=4)
-            
         elif ptype == 'super_stream':
-            # Gera 8 notas em 1/4 de beat (Stream longo)
             notes = self._gen_burst(time, bpm, vert_bias, length=8)
-            
         else:
             notes = self._gen_flow(time, vert_bias)
             
         self.parity = 1 - self.parity
         return notes
 
-    # --- Geradores ---
-    
     def _gen_flow(self, time, v_bias, force_inversion=False):
         hand = self.parity
         state = self.right if hand == 1 else self.left
@@ -220,7 +195,6 @@ class PatternManager:
         return [n1, n2]
 
     def _gen_burst(self, time, bpm, v_bias, length=4):
-        # Gera uma sequência de notas rápidas (1/4 de beat)
         notes = []
         step = 0.25 # 1/4 de beat
         
@@ -228,13 +202,10 @@ class PatternManager:
         
         for i in range(length):
             t = time + (i * step)
-            
-            # Simula lógica de flow simplificada para o burst
             line = 1 if current_hand == 0 else 2
             layer = 0
             cut = 1 # Baixo
             
-            # Inverte direção a cada nota
             if i % 2 == 1: cut = 0 # Cima
             
             note = {
@@ -249,7 +220,7 @@ class PatternManager:
             state = self.right if current_hand == 1 else self.left
             state.update(line, layer, cut)
             
-            current_hand = 1 - current_hand # Troca mão
+            current_hand = 1 - current_hand
             
         self.parity = current_hand
         return notes

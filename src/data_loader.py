@@ -1,11 +1,9 @@
 import json
 import os
 import numpy as np
-import librosa
 from audio_processor import extract_features
 
 def load_beat_map(map_folder):
-    # (Código de carregamento mantido igual, focado na lógica de targets abaixo)
     info_path = os.path.join(map_folder, "Info.dat")
     if not os.path.exists(info_path):
         info_path = os.path.join(map_folder, "info.dat")
@@ -87,9 +85,6 @@ def create_dataset_entry(map_folder):
         frame_idx = int(time_sec / frame_duration)
         
         if frame_idx < num_frames:
-            # Target mais nítido: Apenas 3 frames
-            # Frame exato = 1.0
-            # Vizinhos = 0.2 (apenas para suavizar levemente erros de quantização)
             target_placement[frame_idx, idx_pos] = 1.0
             if frame_idx + 1 < num_frames: 
                 target_placement[frame_idx+1, idx_pos] = max(target_placement[frame_idx+1, idx_pos], 0.2)

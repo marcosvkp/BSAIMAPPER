@@ -1,8 +1,6 @@
-import math
-
 class FlowFixer:
     """
-    Simulador de Paridade e Corretor de Flow (V6 - Resets Longos e Seguros).
+    Simulador de Paridade e Corretor de Flow.
     Foco: Bombas apenas em pausas longas e reentrada correta (Down Cut).
     """
 
@@ -24,10 +22,8 @@ class FlowFixer:
         fixed_left, resets_left = FlowFixer._process_hand(left, bpm, FlowFixer.LEFT_HAND)
         fixed_right, resets_right = FlowFixer._process_hand(right, bpm, FlowFixer.RIGHT_HAND)
         
-        # Unifica os tempos de reset
         all_resets = sorted(list(set(resets_left + resets_right)))
         
-        # Gera Parede de Bombas Global (4 colunas)
         bombs = []
         for t in all_resets:
             for col in range(4): 
@@ -51,8 +47,6 @@ class FlowFixer:
         resets = []
         sec_per_beat = 60 / bpm
         
-        # --- REGRA DE OURO: TEMPO MÍNIMO PARA BOMBA ---
-        # Só gera bomba se houver um buraco de pelo menos 3.0 segundos (ex: 1.5s antes, 1.5s depois)
         BOMB_THRESHOLD = 3.0 
 
         prev_ended_up = False 
@@ -70,33 +64,23 @@ class FlowFixer:
             curr_note = FlowFixer._sanitize_note(curr_note, hand_type)
             curr_cut = curr_note['_cutDirection']
             
-            # --- PROTEÇÃO DE STREAM (NOVO) ---
-            # Se as notas estão muito próximas (< 0.25s), confia no gerador.
-            # Streams rápidos geralmente já vêm com paridade correta (cima/baixo/cima/baixo).
             if time_diff < 0.25:
                 processed.append(curr_note)
                 prev_note = curr_note
-                # Atualiza estado baseado no corte atual
                 if curr_cut in [0, 4, 5]: prev_ended_up = True
                 elif curr_cut in [1, 6, 7]: prev_ended_up = False
                 continue
 
-            # Determina intenção atual
             curr_goes_up = False
             if curr_cut in [0, 4, 5]: curr_goes_up = True
             elif curr_cut in [1, 6, 7]: curr_goes_up = False
             elif curr_cut == 8: curr_goes_up = curr_note['_lineLayer'] >= 1
             else: curr_goes_up = prev_ended_up 
 
-            # Verifica necessidade de Reset (Quebra de Flow)
             is_reset_needed = (prev_ended_up and curr_goes_up) or (not prev_ended_up and not curr_goes_up)
 
-            # Lógica de Decisão: Corrigir ou Resetar?
             if is_reset_needed:
                 if time_diff < BOMB_THRESHOLD:
-                    # --- CASO 1: Intervalo Curto/Médio -> CORRIGIR NOTA ---
-                    # Não há tempo para reset confortável com bomba.
-                    # Solução: Inverter a nota para manter o flow contínuo.
                     new_cut = FlowFixer._get_inverse_cut(curr_cut)
                     
                     if FlowFixer._is_bad_angle(new_cut, curr_note['_lineIndex'], hand_type):
@@ -104,22 +88,15 @@ class FlowFixer:
                     else:
                         curr_note['_cutDirection'] = new_cut
                     
-                    # O flow foi corrigido, então a intenção inverteu
                     curr_goes_up = not prev_ended_up 
 
                 else:
-                    # --- CASO 2: Intervalo Longo (> 3s) -> RESET COM BOMBA ---
                     bomb_time = (prev_note['_time'] + curr_note['_time']) / 2
                     resets.append(bomb_time)
                     
-                    # --- CORREÇÃO DE REENTRADA (CRÍTICO) ---
-                    # Se houve bomba no chão, o jogador levantou a mão.
-                    # A próxima nota TEM que ser um corte para BAIXO (ou Dot).
-                    # Se for corte para CIMA, é impossível (braço já está em cima).
-                    if curr_goes_up: # Se a nota original era pra cima
-                        # Força para baixo
+                    if curr_goes_up:
                         curr_note['_cutDirection'] = 1 # Down
-                        curr_goes_up = False # Agora vai pra baixo
+                        curr_goes_up = False
             
             processed.append(curr_note)
             prev_note = curr_note
@@ -132,12 +109,10 @@ class FlowFixer:
         line = note['_lineIndex']
         cut = note['_cutDirection']
         
-        # Remove laterais no meio
         if line in [1, 2] and cut in [2, 3]:
             note['_cutDirection'] = 8
             return note
 
-        # Remove cortes para fora nas pontas
         if hand == 0 and line == 0 and cut in [3, 5, 7]: note['_cutDirection'] = 8
         if hand == 1 and line == 3 and cut in [2, 4, 6]: note['_cutDirection'] = 8
         
