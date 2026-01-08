@@ -26,10 +26,7 @@ def calculate_metadata(targets, window=200):
         end = min(num_frames, i + half_window)
         
         chunk_notes = has_note[start:end]
-        if len(chunk_notes) == 0:
-            density = 0
-        else:
-            density = np.sum(chunk_notes) / len(chunk_notes)
+        density = np.sum(chunk_notes) / len(chunk_notes) if len(chunk_notes) > 0 else 0
             
         if density > 0.15: comp_val = 2.0 # Alta/Tech/Stream
         elif density > 0.05: comp_val = 1.0 # Média/Dance
@@ -51,26 +48,35 @@ def calculate_metadata(targets, window=200):
     return metadata
 
 def process_map(map_folder, processed_dir):
+    """
+    Processa uma única pasta de mapa, extraindo features e todos os targets.
+    """
     map_id = os.path.basename(map_folder)
     save_path_x = os.path.join(processed_dir, f"{map_id}_x.npy")
     save_path_y = os.path.join(processed_dir, f"{map_id}_y.npy")
     save_path_meta = os.path.join(processed_dir, f"{map_id}_meta.npy")
+    save_path_cut = os.path.join(processed_dir, f"{map_id}_cut.npy") # Novo arquivo
 
-    if os.path.exists(save_path_x) and os.path.exists(save_path_y) and os.path.exists(save_path_meta):
+    # Verifica se todos os arquivos já existem
+    if all(os.path.exists(p) for p in [save_path_x, save_path_y, save_path_meta, save_path_cut]):
         return None, map_id, "already_processed"
 
     try:
+        # Agora create_dataset_entry retorna 4 itens
         data = create_dataset_entry(map_folder)
         if data is None:
             return None, map_id, "read_error"
             
-        features, targets, vertical_dist = data
+        features, targets, cut_directions, vertical_dist = data
         
+        # Calcula os metadados como antes
         metadata = calculate_metadata(targets)
         
+        # Salva todos os arquivos .npy
         np.save(save_path_x, features)
         np.save(save_path_y, targets)
         np.save(save_path_meta, metadata)
+        np.save(save_path_cut, cut_directions) # Salva o novo target
         
         return vertical_dist, map_id, "success"
         
@@ -84,7 +90,7 @@ def preprocess_all(raw_dir="data/raw_maps", processed_dir="data/processed", max_
     map_folders = [os.path.join(raw_dir, d) for d in os.listdir(raw_dir) if os.path.isdir(os.path.join(raw_dir, d))]
     
     print(f"Encontrados {len(map_folders)} mapas para processar.")
-    print("Gerando features, targets e METADADOS (Complexidade/Verticalidade)...")
+    print("Gerando features, targets, direções de corte e metadados...")
     
     total_vertical_distribution = Counter()
     processed_count = 0
@@ -97,7 +103,7 @@ def preprocess_all(raw_dir="data/raw_maps", processed_dir="data/processed", max_
             
             if status == "success":
                 print(f"Processado: {map_id}")
-                total_vertical_distribution.update(dist)
+                if dist: total_vertical_distribution.update(dist)
                 processed_count += 1
             elif status == "read_error":
                 print(f"Ignorando {map_id} (erro na leitura)")
@@ -107,4 +113,5 @@ def preprocess_all(raw_dir="data/raw_maps", processed_dir="data/processed", max_
     print(f"\nConcluído! {processed_count} mapas processados em {processed_dir}")
 
 if __name__ == "__main__":
+    # Recomendo executar este script agora para gerar os novos dados de treino
     preprocess_all(max_workers=os.cpu_count() or 4)

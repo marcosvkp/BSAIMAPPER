@@ -3,7 +3,7 @@ import shutil
 import torch
 import numpy as np
 from youtube_downloader import download_from_youtube
-from models_optimized import get_model
+from models_optimized import get_model, DirectorNet # Importar V1 para fallback
 from pattern_manager import PatternManager
 from flow_fixer import FlowFixer
 from audio_processor import extract_features, detect_bpm, add_silence, analyze_energy
@@ -27,11 +27,11 @@ DIFFICULTY_PARAMS = {
     "ExpertPlus": {"base_threshold": 0.15, "cooldown_mod": 0.8, "njs": 18, "offset": -0.784}
 }
 
-def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, difficulty_name):
+def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, difficulty_name, intensity_factor=1.0, is_v2_model=False):
     """
     Gera as notas para uma dificuldade específica usando o modelo carregado.
     """
-    print(f"   -> Gerando dificuldade: {difficulty_name}...")
+    print(f"   -> Gerando dificuldade: {difficulty_name} (Intensidade: {intensity_factor:.2f})...")
     
     params = DIFFICULTY_PARAMS[difficulty_name]
     base_threshold = params["base_threshold"]
@@ -43,7 +43,14 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
     inputs = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
     
     with torch.no_grad():
-        p_beat, p_comp, p_vert = model(inputs)
+        outputs = model(inputs)
+        if is_v2_model:
+            p_beat, p_comp, p_vert, p_cut = outputs
+            cut_classes = torch.argmax(p_cut, dim=2).squeeze().cpu().numpy()
+        else:
+            p_beat, p_comp, p_vert = outputs
+            cut_classes = None # Sem previsão de corte para o modelo V1
+
         beat_probs = torch.sigmoid(p_beat).squeeze().cpu().numpy()
         comp_classes = torch.argmax(p_comp, dim=2).squeeze().cpu().numpy()
         vert_classes = torch.argmax(p_vert, dim=2).squeeze().cpu().numpy()
@@ -71,6 +78,7 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
             energy_influence = 0.3
 
         dynamic_threshold = base_threshold + (0.5 - current_energy) * energy_influence
+        dynamic_threshold /= intensity_factor
         dynamic_threshold = np.clip(dynamic_threshold, 0.10, 0.95)
         
         current_cooldown = base_cooldown
@@ -82,27 +90,31 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
                 if beat_probs[i] > beat_probs[i-1] and beat_probs[i] > beat_probs[i+1]:
                     
                     beat_time = round(current_beat * 8) / 8
-                    comp_idx = comp_classes[i]
-                    vert_idx = vert_classes[i]
-                    intensity = beat_probs[i]
-                    gap = (i - last_frame) * frame_dur
                     
-                    meta = pattern_manager.get_pattern(intensity, comp_idx, vert_idx, gap, energy_level=current_energy)
+                    # Extrai a previsão de corte se disponível
+                    predicted_cut = cut_classes[i] if cut_classes is not None else None
+                    
+                    meta = pattern_manager.get_pattern(
+                        intensity=beat_probs[i],
+                        complexity_idx=comp_classes[i],
+                        vertical_idx=vert_classes[i],
+                        predicted_cut_direction=predicted_cut, # Passa a previsão para o PatternManager
+                        time_gap=(i - last_frame) * frame_dur,
+                        energy_level=current_energy
+                    )
                     
                     if meta: 
                         new_notes = pattern_manager.apply_pattern(meta, beat_time, bpm)
                         raw_notes.extend(new_notes)
                         last_frame = i
                         
-                        if meta['type'] == 'burst_fill':
-                            occupied_until_beat = beat_time + 1.0
-                        elif meta['type'] == 'super_stream':
-                            occupied_until_beat = beat_time + 2.0
+                        if meta.get('type') in ['burst_fill', 'super_stream']:
+                            occupied_until_beat = beat_time + (1.0 if meta['type'] == 'burst_fill' else 2.0)
 
     print(f"      Notas geradas (bruto): {len(raw_notes)}")
     
     if len(raw_notes) == 0:
-        print(f"      AVISO: Nenhuma nota gerada para {difficulty_name}. Verifique os thresholds.")
+        print(f"      AVISO: Nenhuma nota gerada para {difficulty_name}. Verifique os thresholds ou aumente a intensidade.")
 
     all_objects = FlowFixer.fix(raw_notes, bpm)
     final_notes = [obj for obj in all_objects if obj['_type'] != 3]
@@ -123,7 +135,7 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
 
 def main():
     print("==================================================")
-    print("   BEAT SABER AI MAPPER - PIPELINE COMPLETA")
+    print("   BEAT SABER AI MAPPER - PIPELINE COMPLETA V2")
     print("==================================================")
     
     url = input("Digite a URL da música (YouTube): ").strip()
@@ -141,14 +153,8 @@ def main():
     song_name = os.path.splitext(os.path.basename(mp3_path))[0]
     
     print("\n[2/5] Configuração de Dificuldades")
-    print("Quais dificuldades deseja gerar?")
-    print("   1 = Easy")
-    print("   2 = Normal")
-    print("   3 = Hard")
-    print("   4 = Expert")
-    print("   5 = ExpertPlus")
-    
-    choices = input("\nExemplo: 1,3,5 -> ").strip()
+    print("Quais dificuldades deseja gerar? (1=E, 2=N, 3=H, 4=X, 5=X+)")
+    choices = input("Exemplo: 1,3,5 -> ").strip()
     selected_diffs = []
     
     try:
@@ -169,9 +175,16 @@ def main():
     
     print(f"Dificuldades selecionadas: {', '.join(selected_diffs)}")
     
+    intensity_factor = 1.0
+    try:
+        intensity_str = input("Fator de Intensidade (ex: 1.0=padrão, 1.5=mais notas): ").strip()
+        if intensity_str: intensity_factor = float(intensity_str)
+    except ValueError:
+        print("Entrada inválida. Usando intensidade padrão (1.0).")
+        intensity_factor = 1.0
+
     output_folder = os.path.join("output", song_name)
-    if os.path.exists(output_folder):
-        shutil.rmtree(output_folder)
+    if os.path.exists(output_folder): shutil.rmtree(output_folder)
     os.makedirs(output_folder)
     
     final_audio_name = "song.egg"
@@ -201,17 +214,29 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = get_model().to(device)
-    if os.path.exists("models/director_net.pth"):
-        model.load_state_dict(torch.load("models/director_net.pth", map_location=device, weights_only=True))
-        model.eval()
+    model_path = "models/director_net_v2.pth"
+    is_v2_model = False
+    
+    if os.path.exists(model_path):
+        print(f"Carregando modelo V2: '{model_path}'")
+        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        is_v2_model = True
     else:
-        print("ERRO: Modelo 'models/director_net.pth' não encontrado.")
-        return
+        print(f"AVISO: Modelo V2 '{model_path}' não encontrado.")
+        old_model_path = "models/director_net.pth"
+        if os.path.exists(old_model_path):
+            print(f"Usando modelo V1 de fallback: '{old_model_path}'")
+            model = DirectorNet().to(device)
+            model.load_state_dict(torch.load(old_model_path, map_location=device, weights_only=True))
+        else:
+            print("ERRO: Nenhum modelo treinado encontrado.")
+            return
+    model.eval()
 
     print("\n[4/5] Gerando mapas...")
     
     for diff in selected_diffs:
-        notes, bombs = generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, diff)
+        notes, bombs = generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, diff, intensity_factor, is_v2_model)
         save_difficulty_dat(notes, bombs, output_folder, f"{diff}.dat")
         
     info_content = create_info_dat(song_name, bpm, final_audio_name, final_cover_name, selected_diffs, DIFFICULTY_PARAMS)
