@@ -6,9 +6,9 @@ from torch.utils.data import DataLoader, Dataset
 import numpy as np
 from models_optimized import get_model
 
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 SEQ_LEN = 200
-EPOCHS = 25 # Um pouco mais pois a tarefa é mais complexa
+EPOCHS = 50 # Um pouco mais pois a tarefa é mais complexa
 LEARNING_RATE = 0.0008
 
 class DirectorDataset(Dataset):
