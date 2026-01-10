@@ -1,54 +1,75 @@
-# 🚀 BSIAMapper Otimizado (Single GPU Edition)
+# 🚀 BSIAMapper V2 - Director AI (RTX 4070 Edition)
 
-Esta versão foi reescrita para rodar eficientemente na sua **RTX 4070**, reduzindo o tempo de treino de "noites inteiras" para **minutos ou poucas horas**, mantendo a qualidade através de um sistema híbrido (IA + Regras).
+Esta versão evoluiu de um simples detector de beats para um **"Diretor de IA"** completo. Agora, a IA não apenas diz "quando" bater, mas também "como" (complexidade, verticalidade, ângulo), enquanto um sistema de regras robusto garante que o mapa seja jogável e divertido.
 
-## 📋 O que mudou?
+## 🌟 Novidades da V2
 
-| Feature | Antes (V4) | Agora (Otimizado) |
-|---------|------------|-------------------|
-| **Foco da IA** | Tentar adivinhar posição, cor e direção de cada nota. | Apenas detectar **QUANDO** ocorre um beat (Onset). |
-| **Arquitetura** | CNN + LSTM Profunda (Pesada). | **CRNN Leve** (Conv1D + GRU). |
-| **Padrões** | A IA tentava "inventar" padrões e errava muito. | **PatternManager** aplica padrões profissionais (Streams, Stacks) deterministicamente. |
-| **Treino** | Sequências de 1000 frames, 100 epochs. | Sequências de 200 frames, 20 epochs. |
-| **Tempo** | Horas/Dias. | **~15-30 Minutos**. |
+| Feature | V1 (Otimizado) | V2 (Director AI) |
+|---------|----------------|------------------|
+| **Inteligência** | Detectava apenas beats (On/Off). | Entende **Contexto, Grid, Memória e Ângulos**. |
+| **Inputs** | Áudio apenas. | Áudio + **Grid Embedding + Histórico de Notas**. |
+| **Controle** | Aleatório baseada em intensidade. | **Multiplicador de Dificuldade** e Thresholds Dinâmicos. |
+| **Flow** | Regras básicas. | **FlowFixer V9** (Streams seguros, resets inteligentes). |
+| **Autoavaliação** | Nenhuma. | **CriticNet** (Opcional) avalia a jogabilidade. |
 
 ---
 
 ## 🛠️ Como Usar
 
-### 1. Pré-processamento (Se ainda não fez)
-Se você já rodou isso antes, **não precisa rodar de novo**. O novo sistema lê os mesmos dados.
+### 1. Pré-processamento
+Gera features de áudio e metadados avançados (complexidade, verticalidade).
 ```bash
 python src/preprocess_data.py
 ```
 
-### 2. Treinamento Otimizado
-Treina o novo modelo leve (`BeatNet`).
+### 2. Treinamento (DirectorNet)
+Treina o modelo principal com Mixed Precision e Batch Size grande (256+).
 ```bash
 python src/train_optimized.py
 ```
-*Isso vai criar o arquivo `models/beat_net_optimized.pth`.*
+*Cria `models/director_net_best.pth`.*
 
 ### 3. Geração de Mapas
-Gera o mapa usando a IA para o ritmo e o `PatternManager` para o flow.
+Gera o mapa com controle total de dificuldade.
 ```bash
 python src/generate_optimized.py
 ```
-*O mapa sairá na pasta `output/OptimizedMap`.*
+*Edite o arquivo para mudar o `difficulty_multiplier` (ex: 1.5 para Expert++).*
 
 ---
 
-## 🧠 Estrutura dos Arquivos Novos
+## 🧠 Arquitetura V2
 
-- **`src/models_optimized.py`**: Contém a `BeatNet`, uma rede neural enxuta focada apenas em achar o ritmo.
-- **`src/pattern_manager.py`**: O "cérebro" determinístico. Contém regras de Beat Saber (alternância de mãos, flow, resets) e templates de padrões (streams, jumps). **Edite aqui se quiser mudar o estilo dos mapas.**
-- **`src/train_optimized.py`**: Script de treino ultra-rápido. Usa "Lazy Loading" para não estourar a RAM e foca em janelas curtas onde a ação acontece.
-- **`src/generate_optimized.py`**: Junta tudo. Pega o áudio -> IA acha os beats -> Pattern Manager coloca as notas -> Salva o arquivo.
+### 1. DirectorNet (`models_optimized.py`)
+- **Backbone**: CNN 1D + GRU Bidirecional + Self-Attention.
+- **Inputs**: Espectrograma, Grid Embedding (onde está o foco?), Memória de Notas (o que veio antes?).
+- **Outputs**: 
+  - `Beat`: Probabilidade de nota.
+  - `Complexity`: Chill, Dance ou Tech/Stream.
+  - `Vertical`: Foco em baixo, meio ou cima.
+  - `Angle`: Direção sugerida do corte (0-8).
 
-## 💡 Dicas de Customização
+### 2. PatternManager (`pattern_manager.py`)
+- Recebe as "ordens" do Diretor (ex: "Faça um stream complexo na camada de cima").
+- Escolhe padrões de um banco expandido (Stacks, Bursts, Sliders, Diagonais).
+- Aplica regras de segurança (Vision Block, Paridade).
 
-Para mudar o estilo do mapa (ex: mais Tech ou mais Dance), você não precisa mais retreinar a IA! Apenas edite o `src/pattern_manager.py`:
+### 3. FlowFixer (`flow_fixer.py`)
+- Pós-processamento que simula as mãos do jogador.
+- Garante que não haja resets ruins em streams rápidos.
+- Insere bombas táticas para forçar resets quando necessário.
 
-1. Abra `src/pattern_manager.py`.
-2. No método `get_pattern_for_intensity`, mude os pesos ou os padrões escolhidos.
-3. Rode `generate_optimized.py` novamente.
+---
+
+## 💡 Dicas para sua RTX 4070
+
+- **Batch Size**: O script está configurado para 256. Se sobrar VRAM, tente 512 em `train_optimized.py`.
+- **Workers**: Use `num_workers=8` ou mais para alimentar a GPU rápido.
+- **Mixed Precision**: Já ativado (`scaler`) para dobrar a velocidade de treino.
+
+## 🔧 Customização Rápida
+
+Quer mapas mais difíceis sem retreinar?
+1. Abra `src/generate_optimized.py`.
+2. Na chamada `generate_map_optimized`, mude `difficulty_multiplier` para `1.5` ou `2.0`.
+3. Isso ajusta automaticamente a densidade, cooldowns e complexidade dos padrões.

@@ -11,6 +11,30 @@ def detect_bpm(file_path):
         return float(tempo[0])
     return float(tempo)
 
+def analyze_energy(file_path, hop_length=512, sr=22050):
+    """
+    Retorna um perfil de energia normalizado (0-1) ao longo do tempo.
+    Útil para detectar seções calmas vs intensas.
+    """
+    try:
+        y, _ = librosa.load(file_path, sr=sr)
+        rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+
+        # Suavização (Moving Average)
+        window_size = int(sr * 2 / hop_length) # Janela de ~2 segundos
+        if window_size > 0:
+            rms = np.convolve(rms, np.ones(window_size)/window_size, mode='same')
+
+        # Normalização Robusta (Percentil 95 para ignorar picos extremos)
+        p95 = np.percentile(rms, 95)
+        if p95 > 0:
+            rms = rms / p95
+
+        return np.clip(rms, 0, 1)
+    except Exception as e:
+        print(f"Erro ao analisar energia: {e}")
+        return np.zeros(100)
+
 def extract_features(file_path, bpm, sr=22050, n_mels=80, hop_length=512):
     """
     Extrai Mel Spectrogram, features de ritmo (Grid), e features de energia (RMS e Onset).
@@ -30,13 +54,13 @@ def extract_features(file_path, bpm, sr=22050, n_mels=80, hop_length=512):
         frames_per_beat = seconds_per_beat / frame_duration
         
         grid_features = np.zeros((num_frames, 2), dtype=np.float32)
-        
+
         for i in range(num_frames):
             beat_pos = i / frames_per_beat
             dist_beat = abs(beat_pos - round(beat_pos))
             if dist_beat < 0.1:
                 grid_features[i, 0] = 1.0 - (dist_beat * 10)
-                
+
             dist_half = abs((beat_pos * 2) - round(beat_pos * 2))
             if dist_half < 0.1:
                 grid_features[i, 1] = 1.0 - (dist_half * 10)
@@ -44,7 +68,7 @@ def extract_features(file_path, bpm, sr=22050, n_mels=80, hop_length=512):
         # 3. Energy Features (Volume e Mudanças)
         # RMS (Volume/Energia bruta)
         rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
-        
+
         # Spectral Flux (Onset Strength) - Mudanças súbitas (batidas)
         onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
 
@@ -57,7 +81,7 @@ def extract_features(file_path, bpm, sr=22050, n_mels=80, hop_length=512):
             rms = np.pad(rms, (0, num_frames - len(rms)))
         else:
             rms = rms[:num_frames]
-            
+
         if len(onset_env) < num_frames:
             onset_env = np.pad(onset_env, (0, num_frames - len(onset_env)))
         else:

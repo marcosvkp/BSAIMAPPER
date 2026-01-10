@@ -32,15 +32,15 @@ def download_ranked_maps(output_dir="data/raw_maps", limit=300):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    print(f"Buscando lista de {limit} mapas rankeados...")
+    print(f"Buscando lista de {limit} mapas do ScoreSaber...")
     # BeatSaver API page size is usually 20. We might need multiple requests if limit > 20.
     # Mas para simplificar, vamos pegar os 'sortOrder=Relevance' que a API entregar.
-    # A API do BeatSaver permite search?q=&ranked=true
+    # A API do BeatSaver permite filtrar por leaderboard
     
     maps_to_download = []
     page = 0
     while len(maps_to_download) < limit:
-        url = f"https://api.beatsaver.com/search/text/{page}?sortOrder=Relevance&ranked=true"
+        url = f"https://api.beatsaver.com/search/text/{page}?sortOrder=Relevance&leaderboard=ScoreSaber"
         try:
             resp = requests.get(url)
             resp.raise_for_status()

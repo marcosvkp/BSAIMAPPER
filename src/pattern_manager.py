@@ -28,9 +28,11 @@ class PatternManager:
             2: ['stream_burst', 'tech_angle', 'double_down', 'burst_fill', 'super_stream', 'diagonal_cross_inverted']
         }
 
-    def get_pattern(self, intensity, complexity_idx, vertical_idx, time_gap, energy_level=0.5):
+    def get_pattern(self, intensity, complexity_idx, vertical_idx, angle_idx, time_gap, energy_level=0.5):
         max_complexity = 2
         allow_bursts = True
+        
+        # Ajustes de dificuldade
         if self.difficulty == "Easy":
             max_complexity = 0
             allow_bursts = False
@@ -63,7 +65,7 @@ class PatternManager:
         if time_gap < min_gap: return None
         
         if self.difficulty in ["Expert", "ExpertPlus"] and time_gap < 0.22 and energy_level > 0.5:
-            return {'type': 'stream_burst', 'vert': vertical_idx}
+            return {'type': 'stream_burst', 'vert': vertical_idx, 'angle': angle_idx}
             
         options = self.patterns.get(complexity_idx, self.patterns[1])
         if not allow_bursts:
@@ -72,13 +74,14 @@ class PatternManager:
 
         chosen_type = random.choice(options)
         
-        return {'type': chosen_type, 'vert': vertical_idx, 'intensity': intensity}
+        return {'type': chosen_type, 'vert': vertical_idx, 'angle': angle_idx, 'intensity': intensity}
 
     def apply_pattern(self, meta, time, bpm):
         if not meta: return []
         
         ptype = meta['type']
         vert_bias = meta['vert']
+        angle_bias = meta.get('angle', 8) # 8 = Any/Dot
         
         notes = []
         
@@ -91,19 +94,18 @@ class PatternManager:
         }
         
         if ptype in func_map:
-            notes = func_map[ptype](time, vert_bias)
+            notes = func_map[ptype](time, vert_bias, angle_bias)
         elif ptype == 'burst_fill':
             notes = self._gen_burst(time, bpm, vert_bias, length=4)
         elif ptype == 'super_stream':
             notes = self._gen_burst(time, bpm, vert_bias, length=8)
         else:
-            notes = self._gen_flow(time, vert_bias)
+            notes = self._gen_flow(time, vert_bias, angle_bias)
             
         self.parity = 1 - self.parity
         return notes
 
     def _get_comfortable_y(self, potential_y, state, time):
-        """Aplica a regra de cooldown para saltos verticais grandes."""
         VERTICAL_JUMP_COOLDOWN_BEATS = 0.5
         is_large_v_jump = (state.y == 0 and potential_y == 2) or \
                           (state.y == 2 and potential_y == 0)
@@ -116,11 +118,8 @@ class PatternManager:
         return potential_y
 
     def _apply_safety_rules(self, potential_x, potential_y, state, time):
-        """Centraliza todas as regras de segurança para posicionamento de notas."""
-        # 1. Cooldown de Salto Vertical
         target_y = self._get_comfortable_y(potential_y, state, time)
 
-        # 2. Prevenção de Vision Block (após nota no meio)
         if state.y == 1 and target_y == 0:
             if potential_x > state.x + 1:
                 potential_x = state.x + 1
@@ -129,34 +128,53 @@ class PatternManager:
         
         line = max(0, min(3, int(potential_x)))
 
-        # 3. Prevenção de Vision Block (notas altas externas)
-        if line in [0, 3]:
-            target_y = min(target_y, 1)
+        # --- ALTERAÇÃO: Permitir Top Layer (y=2) nas laterais em dificuldades altas ---
+        # Antes: if line in [0, 3]: target_y = min(target_y, 1)
+        # Agora: Só restringe se for Easy/Normal. Hard+ libera o teto.
+        if self.difficulty in ["Easy", "Normal"]:
+            if line in [0, 3]:
+                target_y = min(target_y, 1)
         
-        # 4. REGRA OBRIGATÓRIA (PREVENÇÃO): Proibir up-cuts para a camada superior
-        # Se a intenção é ir para a camada 2 com um corte para cima, redireciona para a camada 1.
+        # Regra de corte para cima: Se vou cortar pra cima, idealmente a nota deve estar acima da anterior
         is_up_cut_intent = target_y > state.y
         if target_y == 2 and is_up_cut_intent:
-            target_y = 1 # Força o destino para a camada do meio
+            # Se já estou no topo, não posso subir mais, então mantenho ou desço pra 1 se for muito estranho
+            pass 
 
         return line, target_y
 
-    def _gen_flow(self, time, v_bias):
+    def _gen_flow(self, time, v_bias, angle_bias):
         hand = self.parity
         state = self.right if hand == 1 else self.left
         
-        potential_y = random.choice([1, 2]) if state.y == 0 else 0
-        if v_bias == 2: potential_y = max(1, potential_y)
-        if v_bias == 0: potential_y = min(1, potential_y)
+        # --- ALTERAÇÃO: Lógica de Verticalidade Melhorada ---
+        # Antes: Só subia se estivesse no chão (0).
+        # Agora: Pode transitar 0->1, 1->2, 2->1, etc.
+        
+        if state.y == 0:
+            potential_y = random.choice([0, 1, 2]) # Pode ficar no chão ou subir
+        elif state.y == 1:
+            potential_y = random.choice([0, 2]) # Meio -> Extremos
+        else: # state.y == 2
+            potential_y = random.choice([0, 1]) # Topo -> Desce
+            
+        # Bias da Rede Neural (DirectorNet)
+        if v_bias == 2: potential_y = max(1, potential_y) # Força pra cima
+        if v_bias == 0: potential_y = min(1, potential_y) # Força pra baixo
         
         potential_x = random.choice([0, 1]) if hand == 0 else random.choice([2, 3])
         
         line, target_y = self._apply_safety_rules(potential_x, potential_y, state, time)
 
-        cut = 0 if target_y > state.y else 1
+        # Usa angle_bias se for válido (0-8), senão usa lógica padrão
+        if angle_bias < 8:
+            cut = angle_bias
+        else:
+            cut = 0 if target_y > state.y else 1
+            
         return self._create_note(hand, time, line, target_y, cut)
 
-    def _gen_flow_inverted(self, time, v_bias):
+    def _gen_flow_inverted(self, time, v_bias, angle_bias):
         hand = self.parity
         state = self.right if hand == 1 else self.left
         
@@ -171,11 +189,13 @@ class PatternManager:
         cut = 0 if target_y > state.y else 1
         return self._create_note(hand, time, line, target_y, cut)
 
-    def _gen_wide(self, time, v_bias):
+    def _gen_wide(self, time, v_bias, angle_bias):
         hand = self.parity
         state = self.right if hand == 1 else self.left
         
         potential_y = 0 if v_bias == 0 else 1
+        if v_bias == 2: potential_y = 2 # Permite wide alto
+        
         potential_x = 0 if hand == 0 else 3
         
         line, target_y = self._apply_safety_rules(potential_x, potential_y, state, time)
@@ -185,7 +205,7 @@ class PatternManager:
         else: cut = 6
         return self._create_note(hand, time, line, target_y, cut)
 
-    def _gen_diagonal_cross(self, time, v_bias):
+    def _gen_diagonal_cross(self, time, v_bias, angle_bias):
         hand = self.parity
         state = self.right if hand == 1 else self.left
         
@@ -195,7 +215,7 @@ class PatternManager:
         cut = 0 if target_y > 0 else 1
         return self._create_note(hand, time, line, target_y, cut)
 
-    def _gen_diagonal_cross_inverted(self, time, v_bias):
+    def _gen_diagonal_cross_inverted(self, time, v_bias, angle_bias):
         hand = self.parity
         state = self.right if hand == 1 else self.left
         
@@ -205,16 +225,21 @@ class PatternManager:
         cut = 0 if target_y > 0 else 1
         return self._create_note(hand, time, line, target_y, cut)
 
-    def _gen_double(self, time, v_bias):
-        l_note = self._create_note(0, time, 1, 0, 1)[0]
-        r_note = self._create_note(1, time, 2, 0, 1)[0]
+    def _gen_double(self, time, v_bias, angle_bias):
+        y = 0
+        if v_bias == 2: y = 1
+        l_note = self._create_note(0, time, 1, y, 1)[0]
+        r_note = self._create_note(1, time, 2, y, 1)[0]
         return [l_note, r_note]
 
-    def _gen_tech(self, time, v_bias):
+    def _gen_tech(self, time, v_bias, angle_bias):
         hand = self.parity
         line = 1 if hand == 0 else 2
         layer = 1
-        cut = 2 if hand == 0 else 3 
+        if v_bias == 2: layer = 2
+        if v_bias == 0: layer = 0
+
+        cut = angle_bias if angle_bias < 8 else (2 if hand == 0 else 3)
         return self._create_note(hand, time, line, layer, cut)
 
     def _gen_burst(self, time, bpm, v_bias, length=4):
@@ -233,7 +258,6 @@ class PatternManager:
         return notes
 
     def _create_note(self, hand, time, line, layer, cut):
-        """Cria uma nota e atualiza o estado da mão."""
         state = self.right if hand == 1 else self.left
         state.update(line, layer, cut, time)
         return [{
