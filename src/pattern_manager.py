@@ -1,70 +1,73 @@
-import random
-
 class FlowState:
     """Mantém o controle da posição e direção de corte de cada mão."""
+
     def __init__(self, hand):
         self.hand = hand
         self.x = 1 if hand == 0 else 2
-        self.y = 0
-        self.cut = 1  # Começa cortando para baixo
+        self.y = 1
+        self.cut = 1
 
     def update(self, x, y, cut):
         self.x, self.y, self.cut = x, y, cut
 
+
 class PatternManager:
     """
-    Responsável por traduzir as intenções da IA em padrões de notas concretos.
-    Não filtra mais as notas, apenas as constrói.
+    Traduz as intenções da IA em notas concretas.
+    A diversidade é guiada por contexto (tempo + estado), evitando aleatoriedade pura.
     """
+
     def __init__(self, difficulty="ExpertPlus"):
         self.left = FlowState(0)
         self.right = FlowState(1)
-        self.parity = 1  # 1=Direita, 0=Esquerda
+        self.parity = 1
         self.difficulty = difficulty
 
-    def apply_pattern(self, time, bpm, complexity_idx, vertical_idx, time_gap):
-        """
-        Seleciona e gera um padrão de nota com base nas previsões da IA.
-        A decisão de colocar uma nota JÁ FOI TOMADA. Esta função apenas a constrói.
-        """
+    def _context_index(self, modulo, *values):
+        seed = 0
+        for i, val in enumerate(values, 1):
+            seed += int(abs(val) * 1000) * (i * 31)
+        return seed % modulo
+
+    def apply_pattern(
+        self,
+        time,
+        bpm,
+        complexity_idx,
+        vertical_idx,
+        time_gap,
+        intensity=0.5,
+        star_level=6.0,
+    ):
         notes = []
-        
-        # --- Lógica de Seleção de Padrão ---
-        
-        # Se a IA prevê alta complexidade e o tempo entre notas é curto, é um stream.
-        # Um gap de 0.6 beats é um 1/4 de beat em 100 BPM, ou 1/8 de beat em 200 BPM.
-        is_stream = complexity_idx == 2 and time_gap < (60 / bpm) * 0.6 
+
+        is_stream = complexity_idx == 2 and time_gap < (60 / bpm) * 0.45
+        wants_double = complexity_idx >= 1 and intensity > 0.6
+        high_density = (star_level >= 6.5 and intensity > 0.7) or complexity_idx == 2
 
         if is_stream:
             notes = self._gen_stream_note(time, vertical_idx)
+        elif high_density and wants_double and self._context_index(100, time, intensity) < 35:
+            notes = self._gen_double_note(time, vertical_idx, intensity)
+        elif complexity_idx == 0:
+            notes = self._gen_single_note(time, vertical_idx, intensity)
+        elif complexity_idx == 1:
+            if self._context_index(10, time, vertical_idx, intensity) < 3:
+                notes = self._gen_wide_note(time, vertical_idx)
+            else:
+                notes = self._gen_single_note(time, vertical_idx, intensity)
         else:
-            # Para gaps maiores, usa a complexidade para decidir o padrão.
-            if complexity_idx == 0: # Chill: Notas simples, mais espaçadas
-                notes = self._gen_single_note(time, vertical_idx)
-            elif complexity_idx == 1: # Dance: Mais movimento, doubles, wide notes
-                # Maior chance de doubles ou wide notes para dance
-                if random.random() < 0.4: # 40% chance de um double
-                    notes = self._gen_double_note(time, vertical_idx)
-                else:
-                    notes = self._gen_wide_note(time, vertical_idx)
-            elif complexity_idx == 2: # Tech: Padrões complexos, towers, doubles
-                # Maior chance de patterns mais complexos para tech
-                if random.random() < 0.3: # 30% chance de um tower
-                    notes = self._gen_tower_stack(time, vertical_idx)
-                else:
-                    notes = self._gen_double_note(time, vertical_idx) # Doubles também são tech
-        
-        # Inverte a paridade da mão para a próxima nota (se um padrão de mão única foi gerado)
+            if self._context_index(10, time, time_gap, intensity) < 2:
+                notes = self._gen_tower_stack(time)
+            else:
+                notes = self._gen_single_note(time, vertical_idx, intensity)
+
         if len(notes) == 1:
             self.parity = 1 - self.parity
-        # Se um double foi gerado, a paridade não precisa mudar para a próxima batida.
 
         return notes
 
-    # --- GERADORES DE PADRÕES ---
-
     def _create_note(self, hand, time, line, layer, cut):
-        """Cria uma única nota e atualiza o estado da mão correspondente."""
         state = self.right if hand == 1 else self.left
         state.update(line, layer, cut)
         return [{
@@ -72,94 +75,83 @@ class PatternManager:
             "_lineIndex": line,
             "_lineLayer": layer,
             "_type": hand,
-            "_cutDirection": cut
+            "_cutDirection": cut,
         }]
 
-    def _gen_single_note(self, time, v_bias):
-        """Gera uma nota simples, focada no fluxo e com viés de amplitude."""
-        hand = self.parity
-        
-        # --- Escolha da Linha (Coluna) com viés de amplitude ---
-        if hand == 0: # Mão esquerda
-            # Mais chance de ir para a coluna 0 (mais à esquerda)
-            line = random.choices([0, 1], weights=[0.6, 0.4], k=1)[0]
-        else: # Mão direita
-            # Mais chance de ir para a coluna 3 (mais à direita)
-            line = random.choices([2, 3], weights=[0.4, 0.6], k=1)[0]
-        
-        # --- Escolha da Camada (Linha Vertical) baseada no v_bias ---
-        if v_bias == 0: # Viés para baixo
-            layer = random.choice([0, 1])
-        elif v_bias == 2: # Viés para cima
-            layer = random.choice([1, 2])
-        else: # Viés para o meio
-            layer = 1
-        
-        # --- Direção de Corte ---
-        # Tenta manter o fluxo (cima/baixo)
-        state = self.right if hand == 1 else self.left
-        if layer > state.y: cut = 0 # Subiu, cortar para cima
-        elif layer < state.y: cut = 1 # Desceu, cortar para baixo
-        else: cut = random.choice([0, 1]) # Mesma altura, aleatório
+    def _pick_layer(self, v_bias, hand, intensity, time):
+        if v_bias == 0:
+            base = [0, 0, 1]
+        elif v_bias == 2:
+            base = [1, 2, 2]
+        else:
+            base = [0, 1, 1, 2]
 
-        # Chance de corte diagonal para variedade
-        if random.random() > 0.7:
-            if hand == 0: cut = random.choice([4, 6]) # UpLeft, DownLeft
-            else: cut = random.choice([5, 7]) # UpRight, DownRight
-            
+        idx = self._context_index(len(base), time, intensity, hand, v_bias)
+        return base[idx]
+
+    def _pick_line(self, hand, intensity, time, spread_bias):
+        if hand == 0:
+            pool = [0, 1] if spread_bias < 0.5 else [0, 1, 2]
+        else:
+            pool = [2, 3] if spread_bias < 0.5 else [1, 2, 3]
+
+        idx = self._context_index(len(pool), time, intensity, spread_bias)
+        return pool[idx]
+
+    def _gen_single_note(self, time, v_bias, intensity):
+        hand = self.parity
+        line = self._pick_line(hand, intensity, time, spread_bias=intensity)
+        layer = self._pick_layer(v_bias, hand, intensity, time)
+
+        state = self.right if hand == 1 else self.left
+        if layer > state.y:
+            cut = 0
+        elif layer < state.y:
+            cut = 1
+        else:
+            cut = 0 if self._context_index(2, time, state.cut, hand) == 0 else 1
+
+        if self._context_index(10, time, intensity, hand, v_bias) > 7:
+            cut = 4 if hand == 0 else 5
         return self._create_note(hand, time, line, layer, cut)
 
     def _gen_stream_note(self, time, v_bias):
-        """Gera uma nota otimizada para streams, alternando a direção de corte."""
         hand = self.parity
         state = self.right if hand == 1 else self.left
-        
-        # Em streams, a posição vertical tende a ser mais estável e central
-        layer = state.y
-        if v_bias == 0: layer = 0
-        elif v_bias == 2: layer = 1 # Camada 2 em streams é rara
-        
-        # Linhas centrais para streams
-        line = random.choice([1, 2]) 
 
-        # Alterna o corte (cima/baixo) para manter o fluxo do stream
-        cut = 1 - state.cut if state.cut in [0, 1] else random.choice([0, 1])
-        
+        if v_bias == 0:
+            layer = 0
+        elif v_bias == 2:
+            layer = 1
+        else:
+            layer = 1
+
+        line_pool = [1, 2] if state.x in [0, 3] else [state.x, 1 if hand == 0 else 2]
+        line = line_pool[self._context_index(len(line_pool), time, state.x, state.y)]
+        cut = 1 - state.cut if state.cut in [0, 1] else 1
         return self._create_note(hand, time, line, layer, cut)
 
     def _gen_wide_note(self, time, v_bias):
-        """Gera uma nota mais afastada, comum em padrões "dance"."""
         hand = self.parity
-        line = 0 if hand == 0 else 3 # Força as colunas externas
-        layer = 0 if v_bias == 0 else 1 # Bias para camadas baixas/médias
-        cut = random.choice([1, 6, 7]) if hand == 0 else random.choice([1, 4, 5]) # Cortes para fora ou para baixo
+        line = 0 if hand == 0 else 3
+        layer = 0 if v_bias == 0 else 1 if v_bias == 1 else 2
+        cut = 6 if hand == 0 else 7
         return self._create_note(hand, time, line, layer, cut)
 
-    def _gen_double_note(self, time, v_bias):
-        """Gera duas notas simultâneas, uma para cada mão, com chance de ser wide."""
-        # Decide se é um double wide ou central
-        if random.random() < 0.5: # 50% chance para double wide
-            l_line = 0
-            r_line = 3
+    def _gen_double_note(self, time, v_bias, intensity):
+        if intensity > 0.78:
+            l_line, r_line = 0, 3
         else:
-            l_line = 1
-            r_line = 2
-        
-        layer = 0 if v_bias == 0 else 1 # Bias para camadas baixas/médias para doubles
-        cut = 1 # Corte para baixo para doubles (mais comum e confortável)
-        
-        l_note = self._create_note(0, time, l_line, layer, cut)[0]
-        r_note = self._create_note(1, time, r_line, layer, cut)[0]
+            l_line, r_line = 1, 2
+
+        layer = 0 if v_bias == 0 else 1 if v_bias == 1 else 2
+        l_note = self._create_note(0, time, l_line, layer, 1)[0]
+        r_note = self._create_note(1, time, r_line, layer, 1)[0]
         return [l_note, r_note]
 
-    def _gen_tower_stack(self, time, v_bias):
-        """Gera duas notas empilhadas verticalmente para a mesma mão."""
+    def _gen_tower_stack(self, time):
         hand = self.parity
-        line = 1 if hand == 0 else 2 # Torres geralmente são mais centrais
-        
-        # A mão se move de baixo para cima
-        n1 = self._create_note(hand, time, line, 0, 0)[0] # Nota de baixo, corte para cima
-        n2 = self._create_note(hand, time, line, 2, 0)[0] # Nota de cima, corte para cima
-        
-        # Não inverte a paridade, pois a mesma mão foi usada
-        return [n1, n2]
+        line = 1 if hand == 0 else 2
+        low = self._create_note(hand, time, line, 0, 0)[0]
+        high = self._create_note(hand, time, line, 2, 0)[0]
+        return [low, high]
