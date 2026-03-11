@@ -168,10 +168,10 @@ def create_info_dat(song_name, bpm, audio_filename, cover_filename, difficulties
             "_beatmapFilename": f"{diff_name}.dat",
             "_noteJumpMovementSpeed": params["njs"],
             "_noteJumpStartBeatOffset": params["offset"],
-        })
+        }) # parametros perfeitos para o Info.dat funcionarem corretamente
         
     info = {
-        "_version": "2.1.0",
+        "_version": "2.1.0", # Obrigatoriamente 2.0 ou 2.1 ou seja v2 notes
         "_songName": song_name,
         "_songSubName": "AI Generated",
         "_songAuthorName": "Artist",
