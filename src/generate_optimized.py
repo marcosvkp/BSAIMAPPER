@@ -14,7 +14,43 @@ def zip_folder(folder_path, output_path):
     shutil.make_archive(output_path, 'zip', folder_path)
     print(f"Mapa compactado: {output_path}.zip")
 
-def generate_map_optimized(audio_path, output_folder):
+def _select_note_frames(beat_probs, energy_profile, bpm, frame_dur, target_stars):
+    """Seleciona frames candidatos com base na confiança da IA e meta suave de densidade."""
+    peaks = []
+    for i in range(1, len(beat_probs) - 1):
+        if beat_probs[i] > beat_probs[i - 1] and beat_probs[i] > beat_probs[i + 1]:
+            score = beat_probs[i] * (0.7 + 0.6 * energy_profile[i])
+            peaks.append((score, i))
+
+    if not peaks:
+        return []
+
+    # Densidade alvo guiada pela IA + ajuste suave por estrelas (sem regra rígida)
+    ai_conf = float(np.mean(beat_probs))
+    base_nps = 1.2 + ai_conf * 6.5
+    star_boost = 1.0 + np.clip((target_stars - 5.0) * 0.08, -0.2, 0.4)
+    target_nps = base_nps * star_boost
+
+    duration_seconds = len(beat_probs) * frame_dur
+    target_total_notes = int(max(80, duration_seconds * target_nps))
+
+    min_fraction = 8.0 if target_stars >= 7.0 else 4.0
+    cooldown_frames = max(1, int((60.0 / bpm / min_fraction) / frame_dur))
+
+    peaks.sort(key=lambda x: x[0], reverse=True)
+    selected = []
+    for score, idx in peaks:
+        if len(selected) >= target_total_notes:
+            break
+        if any(abs(idx - j) < cooldown_frames for j in selected):
+            continue
+        selected.append(idx)
+
+    selected.sort()
+    return selected
+
+
+def generate_map_optimized(audio_path, output_folder, target_stars=7.0):
     if not os.path.exists(output_folder): os.makedirs(output_folder)
     print(f"Processando: {audio_path}")
     
@@ -38,87 +74,64 @@ def generate_map_optimized(audio_path, output_folder):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = get_model().to(device)
     
-    if os.path.exists("models/director_net.pth"):
-        model.load_state_dict(torch.load("models/director_net.pth", map_location=device, weights_only=True))
+    model_path = "models/director_net_v2_stars.pth"
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=device))
     else:
-        print("Modelo DirectorNet não encontrado! Treine primeiro.")
+        print(f"Modelo '{model_path}' não encontrado! Treine primeiro.")
         return
 
     model.eval()
     
     inputs = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
+    stars_tensor = torch.tensor([[target_stars]], dtype=torch.float32).to(device)
     with torch.no_grad():
-        p_beat, p_comp, p_vert = model(inputs)
+        p_beat, p_comp, p_vert = model(inputs, stars_tensor)
         beat_probs = torch.sigmoid(p_beat).squeeze().cpu().numpy()
         comp_classes = torch.argmax(p_comp, dim=2).squeeze().cpu().numpy()
         vert_classes = torch.argmax(p_vert, dim=2).squeeze().cpu().numpy()
         
     pattern_manager = PatternManager()
     raw_notes = []
-    
+
     frame_dur = hop_length / sr
     sec_per_beat = 60 / bpm
-    
-    base_threshold = 0.5
-    base_cooldown = int(0.1 / frame_dur)
-    last_frame = -base_cooldown
-    
-    # Controle de ocupação temporal (para bursts)
-    occupied_until_beat = 0.0
-    
-    MIN_START_TIME = 3.0 
 
-    print("Gerando com Director AI (Energy Aware + Burst Fill)...")
-    
-    for i in range(len(beat_probs)):
-        time_sec = i * frame_dur
-        current_beat = time_sec / sec_per_beat
-        
-        if time_sec < MIN_START_TIME:
-            continue
-            
-        # Se o tempo atual já está ocupado por um burst anterior, pula
-        if current_beat < occupied_until_beat:
-            continue
-            
-        current_energy = energy_profile[i]
-        
-        # --- Threshold Dinâmico ---
-        dynamic_threshold = base_threshold + (0.5 - current_energy) * 0.6
-        dynamic_threshold = np.clip(dynamic_threshold, 0.15, 0.85)
-        
-        # --- Cooldown Dinâmico ---
-        current_cooldown = base_cooldown
-        if current_energy > 0.75:
-            current_cooldown = int(base_cooldown * 0.6) 
+    selected_indices = _select_note_frames(
+        beat_probs=beat_probs,
+        energy_profile=energy_profile,
+        bpm=bpm,
+        frame_dur=frame_dur,
+        target_stars=target_stars,
+    )
 
-        if beat_probs[i] > dynamic_threshold and (i - last_frame) > current_cooldown:
-            # Peak picking local simples
-            if i > 0 and i < len(beat_probs)-1:
-                if beat_probs[i] > beat_probs[i-1] and beat_probs[i] > beat_probs[i+1]:
-                    
-                    beat_time = round(current_beat * 8) / 8
-                    
-                    comp_idx = comp_classes[i]
-                    vert_idx = vert_classes[i]
-                    intensity = beat_probs[i]
-                    gap = (i - last_frame) * frame_dur
-                    
-                    meta = pattern_manager.get_pattern(intensity, comp_idx, vert_idx, gap, energy_level=current_energy)
-                    
-                    if meta: 
-                        new_notes = pattern_manager.apply_pattern(meta, beat_time, bpm)
-                        raw_notes.extend(new_notes)
-                        last_frame = i
-                        
-                        # Se gerou um burst, atualiza o tempo ocupado
-                        if meta['type'] == 'burst_fill':
-                            # Burst ocupa 1 beat inteiro (4 notas de 1/4)
-                            occupied_until_beat = beat_time + 1.0
-                        elif meta['type'] == 'super_stream':
-                            # Super Stream ocupa 2 beats inteiros (8 notas de 1/4)
-                            occupied_until_beat = beat_time + 2.0
-    
+    print(f"Gerando com Director AI (estrelas={target_stars:.2f})...")
+
+    last_frame = -99999
+    for idx in selected_indices:
+        time_sec = idx * frame_dur
+        if time_sec < 2.0:
+            continue
+
+        beat_time = round((time_sec / sec_per_beat) * 16) / 16.0
+        comp_idx = int(comp_classes[idx])
+        vert_idx = int(vert_classes[idx])
+        intensity = float(beat_probs[idx])
+        gap = (idx - last_frame) * frame_dur
+
+        new_notes = pattern_manager.apply_pattern(
+            time=beat_time,
+            bpm=bpm,
+            complexity_idx=comp_idx,
+            vertical_idx=vert_idx,
+            time_gap=gap,
+            intensity=intensity,
+            star_level=target_stars,
+        )
+        if new_notes:
+            raw_notes.extend(new_notes)
+            last_frame = idx
+
     print("Aplicando FlowFixer (Simulação de Paridade e Resets)...")
     all_objects = FlowFixer.fix(raw_notes, bpm)
     
@@ -179,4 +192,4 @@ def save_beatmap(notes, bombs, bpm, folder, audio_name):
     with open(os.path.join(folder, "Info.dat"), 'w') as f: json.dump(info, f, indent=2)
 
 if __name__ == "__main__":
-    generate_map_optimized("musica.mp3", "output/DirectorMap")
+    generate_map_optimized("musica.mp3", "output/DirectorMap", target_stars=7.5)

@@ -37,15 +37,17 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
         vert_classes = torch.argmax(p_vert, dim=2).squeeze().cpu().numpy()
 
     # --- Lógica de Densidade de Notas (Target Density) ---
-    # Em vez de thresholds, calculamos quantas notas o mapa DEVE ter baseado nas estrelas.
-    # Fórmula aproximada: NPS (Notas por Segundo) ~ 1.0 + (Estrelas * 0.7)
-    # Ex: 4 estrelas = 3.8 NPS | 8 estrelas = 6.6 NPS (média global, picos serão maiores)
-    target_nps = 1.0 + (target_stars * 0.75)
-    
+    # A densidade é guiada principalmente pela confiança média da IA,
+    # com as estrelas atuando como ajuste suave (não uma regra bruta).
+    ai_conf = float(np.mean(beat_probs))
+    base_nps = 1.2 + ai_conf * 6.5
+    star_boost = 1.0 + np.clip((target_stars - 5.0) * 0.08, -0.2, 0.4)
+    target_nps = base_nps * star_boost
+
     duration_seconds = len(beat_probs) * (hop_length / sr)
-    target_total_notes = int(duration_seconds * target_nps)
-    
-    print(f"      Meta de Densidade: {target_nps:.2f} NPS (~{target_total_notes} notas)")
+    target_total_notes = int(max(80, duration_seconds * target_nps))
+
+    print(f"      Meta de Densidade AI-driven: {target_nps:.2f} NPS (~{target_total_notes} notas)")
 
     frame_dur = hop_length / sr
     # Cooldown mínimo absoluto (físico) para evitar sobreposição impossível
@@ -121,11 +123,13 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
         
         # O PatternManager constrói a nota baseada na "intenção" (classes) da IA naquele momento
         new_notes = pattern_manager.apply_pattern(
-            time=beat_time, 
+            time=beat_time,
             bpm=bpm,
-            complexity_idx=comp_classes[idx], 
-            vertical_idx=vert_classes[idx], 
-            time_gap=time_gap
+            complexity_idx=comp_classes[idx],
+            vertical_idx=vert_classes[idx],
+            time_gap=time_gap,
+            intensity=float(beat_probs[idx]),
+            star_level=target_stars,
         )
         
         if new_notes:
