@@ -8,6 +8,8 @@ from models_optimized import get_model
 from pattern_manager import PatternManager
 from flow_fixer import FlowFixer
 from audio_processor import extract_features, detect_bpm, add_silence, analyze_energy
+from difficulty_tuning import compute_target_nps, compute_min_beat_fraction, candidate_score
+from generation_logging import GenerationLogger
 
 DIFFICULTY_MAP = {1: "Easy", 2: "Normal", 3: "Hard", 4: "Expert", 5: "ExpertPlus"}
 DIFFICULTY_PARAMS = {
@@ -23,7 +25,7 @@ def zip_folder(folder_path, output_path):
     shutil.make_archive(output_path, 'zip', folder_path)
     print(f"Pacote final criado: {output_path}.zip")
 
-def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, difficulty_name, target_stars):
+def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, difficulty_name, target_stars, logger=None):
     print(f"   -> Gerando: {difficulty_name} ({target_stars:.2f} estrelas)...")
     
     device = next(model.parameters()).device
@@ -37,21 +39,21 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
         vert_classes = torch.argmax(p_vert, dim=2).squeeze().cpu().numpy()
 
     # --- Lógica de Densidade de Notas (Target Density) ---
-    # Em vez de thresholds, calculamos quantas notas o mapa DEVE ter baseado nas estrelas.
-    # Fórmula aproximada: NPS (Notas por Segundo) ~ 1.0 + (Estrelas * 0.7)
-    # Ex: 4 estrelas = 3.8 NPS | 8 estrelas = 6.6 NPS (média global, picos serão maiores)
-    target_nps = 1.0 + (target_stars * 0.75)
-    
+    # A densidade é guiada principalmente pela confiança média da IA,
+    # com as estrelas atuando como ajuste suave (não uma regra bruta).
+    ai_conf = float(np.mean(beat_probs))
+    target_nps = compute_target_nps(ai_conf, target_stars)
+
     duration_seconds = len(beat_probs) * (hop_length / sr)
-    target_total_notes = int(duration_seconds * target_nps)
-    
-    print(f"      Meta de Densidade: {target_nps:.2f} NPS (~{target_total_notes} notas)")
+    target_total_notes = int(max(80, duration_seconds * target_nps))
+
+    print(f"      Meta de Densidade AI-driven: {target_nps:.2f} NPS (~{target_total_notes} notas)")
 
     frame_dur = hop_length / sr
     # Cooldown mínimo absoluto (físico) para evitar sobreposição impossível
     # 60/BPM = seg/beat. /4 = 1/4 de beat.
     # Em mapas rápidos, permitimos até 1/8.
-    min_beat_fraction = 8.0 if target_stars > 7 else 4.0
+    min_beat_fraction = compute_min_beat_fraction(target_stars)
     min_cooldown_frames = int((60.0 / bpm / min_beat_fraction) / frame_dur)
     
     # 1. Encontrar TODOS os picos locais (candidatos a nota)
@@ -69,7 +71,7 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
         if prob > beat_probs[i-1] and prob > beat_probs[i+1]:
             # Adiciona à lista de candidatos: (probabilidade, índice_frame)
             # Multiplicamos a probabilidade pela energia local para dar preferência a partes intensas
-            score = prob * (0.8 + 0.4 * energy_profile[i])
+            score = candidate_score(prob, energy_profile[i])
             candidates.append((score, i))
             
     # 2. Ordenar candidatos pela confiança da IA (do maior para o menor)
@@ -77,8 +79,6 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
     
     # 3. Selecionar os melhores picos respeitando o cooldown e a meta de notas
     selected_indices = []
-    occupied_frames = set()
-    
     # Margem de segurança para o cooldown (evitar notas coladas demais)
     cooldown_margin = min_cooldown_frames
     
@@ -121,11 +121,13 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
         
         # O PatternManager constrói a nota baseada na "intenção" (classes) da IA naquele momento
         new_notes = pattern_manager.apply_pattern(
-            time=beat_time, 
+            time=beat_time,
             bpm=bpm,
-            complexity_idx=comp_classes[idx], 
-            vertical_idx=vert_classes[idx], 
-            time_gap=time_gap
+            complexity_idx=comp_classes[idx],
+            vertical_idx=vert_classes[idx],
+            time_gap=time_gap,
+            intensity=float(beat_probs[idx]),
+            star_level=target_stars,
         )
         
         if new_notes:
@@ -143,6 +145,8 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
                 pass
 
     print(f"      Notas geradas (bruto): {len(raw_notes)}")
+    if logger is not None:
+        logger.log("difficulty_raw", difficulty=difficulty_name, stars=target_stars, selected_frames=len(selected_indices), raw_notes=len(raw_notes), target_nps=target_nps)
     
     # FlowFixer
     all_objects = FlowFixer.fix(raw_notes, bpm)
@@ -152,7 +156,9 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
     final_notes.sort(key=lambda x: x['_time'])
     unique_bombs = [dict(t) for t in {tuple(d.items()) for d in final_bombs}]
     unique_bombs.sort(key=lambda x: x['_time'])
-            
+    if logger is not None:
+        logger.log("difficulty_final", difficulty=difficulty_name, stars=target_stars, notes=len(final_notes), bombs=len(unique_bombs))
+
     return final_notes, unique_bombs
 
 def create_info_dat(song_name, bpm, audio_filename, cover_filename, difficulties_data):
@@ -188,8 +194,10 @@ def save_difficulty_dat(notes, bombs, folder, filename):
 
 def main():
     print("="*50 + "\n   BEAT SABER AI MAPPER V2 - GERAÇÃO POR URL\n" + "="*50)
+    logger = GenerationLogger(session_name="generate_from_url")
     
     url = input("Digite a URL da música (YouTube): ").strip()
+    logger.log("start", url=url)
     if not url: print("URL inválida."); return
 
     print("\n[1/5] Baixando e processando áudio...")
@@ -253,7 +261,7 @@ def main():
 
     print("\n[5/5] Gerando mapas...")
     for diff_name, data in difficulties_with_stars.items():
-        notes, bombs = generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, diff_name, data['stars'])
+        notes, bombs = generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, diff_name, data['stars'], logger=logger)
         save_difficulty_dat(notes, bombs, output_folder, f"{diff_name}.dat")
         
     info_content = create_info_dat(song_name, bpm, final_audio_name, final_cover_name, difficulties_with_stars)
@@ -262,7 +270,9 @@ def main():
     zip_folder(output_folder, os.path.join("output", song_name.replace(" ", "_")))
     try: shutil.rmtree("data/temp_download")
     except: pass
-        
+
+    log_path, event_count = logger.summary()
+    print(f"Log salvo em {log_path} ({event_count} eventos).")
     print("\nSUCESSO! Mapa gerado em 'output/'")
 
 if __name__ == "__main__":
