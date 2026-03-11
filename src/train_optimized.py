@@ -17,6 +17,7 @@ class DirectorDataset(Dataset):
     def __init__(self, processed_dir, seq_len):
         self.processed_dir = processed_dir
         # Garante que estamos pegando apenas a base dos nomes de arquivo
+        # Ex: "map_id_ExpertPlus"
         self.files = list(set([f.replace('_x.npy', '') for f in os.listdir(processed_dir) if f.endswith('_x.npy')]))
         self.seq_len = seq_len
         
@@ -30,11 +31,13 @@ class DirectorDataset(Dataset):
         # Caminhos para todos os arquivos de dados
         path_x = os.path.join(self.processed_dir, f"{file_base}_x.npy")
         path_y = os.path.join(self.processed_dir, f"{file_base}_y.npy")
+        path_meta = os.path.join(self.processed_dir, f"{file_base}_meta.npy") # Novo
         path_stars = os.path.join(self.processed_dir, f"{file_base}_stars.npy")
 
         # Carrega os dados usando mmap_mode para eficiência de memória
         features = np.load(path_x, mmap_mode='r')
         targets = np.load(path_y, mmap_mode='r')
+        metadata = np.load(path_meta, mmap_mode='r') # Novo
         stars = np.load(path_stars) # Estrelas é um valor único, não precisa de mmap
 
         # Seleciona um trecho aleatório da música
@@ -45,20 +48,12 @@ class DirectorDataset(Dataset):
         feat_crop = np.array(features[start:end])
         targ_crop = np.array(targets[start:end])
         
-        # --- Engenharia de Targets On-the-Fly ---
+        # --- Carrega Metadados Pré-calculados ---
+        comp_target = np.array(metadata[start:end, 0]).astype(np.longlong)
+        vert_target = np.array(metadata[start:end, 1]).astype(np.longlong)
+        
+        # Beat target ainda é calculado on-the-fly para garantir que corresponda ao targ_crop
         beat_target = np.any(targ_crop > 0.1, axis=1).astype(np.float32).reshape(-1, 1)
-        
-        density = np.mean(beat_target)
-        if density > 0.15: comp_val = 2
-        elif density > 0.05: comp_val = 1
-        else: comp_val = 0
-        comp_target = np.full((self.seq_len,), comp_val, dtype=np.longlong)
-        
-        l0 = np.sum(targ_crop[:, 0:4]); l1 = np.sum(targ_crop[:, 4:8]); l2 = np.sum(targ_crop[:, 8:12])
-        total = l0 + l1 + l2 + 1e-6
-        avg_h = (0*l0 + 1*l1 + 2*l2) / total
-        vert_val = int(round(avg_h))
-        vert_target = np.full((self.seq_len,), vert_val, dtype=np.longlong)
         
         # Padding, se necessário
         pad_len = self.seq_len - feat_crop.shape[0]

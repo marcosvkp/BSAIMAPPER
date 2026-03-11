@@ -1,6 +1,7 @@
 import os
 import numpy as np
 from data_loader import create_dataset_entry
+from parser.loader import get_all_valid_difficulties # Importa a função para listar dificuldades
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 
@@ -42,41 +43,51 @@ def calculate_metadata(targets, window=200):
         
     return metadata
 
-def process_map(map_folder, processed_dir):
+def process_map_difficulty(map_folder, diff_info, processed_dir):
+    """
+    Processa uma única dificuldade de um mapa.
+    diff_info: (diff_name, diff_filename, stars)
+    """
     map_id = os.path.basename(map_folder)
-    save_path_x = os.path.join(processed_dir, f"{map_id}_x.npy")
-    save_path_y = os.path.join(processed_dir, f"{map_id}_y.npy")
-    save_path_meta = os.path.join(processed_dir, f"{map_id}_meta.npy")
-    save_path_stars = os.path.join(processed_dir, f"{map_id}_stars.npy") # Novo caminho
+    diff_name, diff_filename, stars = diff_info
+    
+    # Nome do arquivo de saída inclui o ID do mapa, a dificuldade e as estrelas para unicidade
+    # Ex: 1a2b3_ExpertPlus_x.npy
+    base_name = f"{map_id}_{diff_name}"
+    
+    save_path_x = os.path.join(processed_dir, f"{base_name}_x.npy")
+    save_path_y = os.path.join(processed_dir, f"{base_name}_y.npy")
+    save_path_meta = os.path.join(processed_dir, f"{base_name}_meta.npy")
+    save_path_stars = os.path.join(processed_dir, f"{base_name}_stars.npy")
 
-    # Pula apenas se TODOS os arquivos de dados já existirem
+    # Pula se TODOS os arquivos já existirem
     if all(os.path.exists(p) for p in [save_path_x, save_path_y, save_path_meta, save_path_stars]):
-        return None, map_id, "already_processed"
+        return None, base_name, "already_processed"
 
     try:
-        data = create_dataset_entry(map_folder)
-        if data is None:
-            return None, map_id, "read_error"
-            
-        # Desempacota o novo valor de estrelas
-        features, targets, vertical_dist, stars = data
+        # Chama create_dataset_entry com a dificuldade específica
+        data = create_dataset_entry(map_folder, diff_filename, diff_name, stars)
         
-        # Calcula os metadados como antes
+        if data is None:
+            return None, base_name, "read_error"
+            
+        features, targets, vertical_dist, stars_val = data
+        
+        # Calcula metadados
         metadata = calculate_metadata(targets)
         
-        # Salva todos os arquivos de dados
+        # Salva os arquivos
         np.save(save_path_x, features)
         np.save(save_path_y, targets)
         np.save(save_path_meta, metadata)
-        np.save(save_path_stars, np.array([stars])) # Salva as estrelas como um array numpy
+        np.save(save_path_stars, np.array([stars_val]))
         
-        return vertical_dist, map_id, "success"
+        return vertical_dist, base_name, "success"
         
     except Exception as e:
-        # Adiciona mais detalhes ao log de erro
         import traceback
         error_details = traceback.format_exc()
-        return None, map_id, f"fatal_error: {e}\n{error_details}"
+        return None, base_name, f"fatal_error: {e}\n{error_details}"
 
 def preprocess_all(raw_dir="data/raw_maps", processed_dir="data/processed", max_workers=8):
     if not os.path.exists(processed_dir):
@@ -84,35 +95,44 @@ def preprocess_all(raw_dir="data/raw_maps", processed_dir="data/processed", max_
         
     map_folders = [os.path.join(raw_dir, d) for d in os.listdir(raw_dir) if os.path.isdir(os.path.join(raw_dir, d))]
     
-    print(f"Encontrados {len(map_folders)} mapas para processar.")
+    print(f"Encontradas {len(map_folders)} pastas de mapas.")
+    print("Buscando todas as dificuldades válidas (com estrelas)...")
+    
+    # Lista de tarefas: (map_folder, diff_info)
+    all_tasks = []
+    
+    # Pré-escaneamento para encontrar todas as dificuldades válidas
+    for folder in map_folders:
+        valid_diffs = get_all_valid_difficulties(folder)
+        for diff_info in valid_diffs:
+            all_tasks.append((folder, diff_info))
+            
+    print(f"Total de {len(all_tasks)} dificuldades válidas encontradas para processamento.")
     print("Gerando features, targets, metadados e DADOS DE ESTRELAS...")
     
-    total_vertical_distribution = Counter()
     processed_count = 0
     skipped_count = 0
     error_count = 0
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(process_map, folder, processed_dir) for folder in map_folders]
+        futures = [executor.submit(process_map_difficulty, folder, diff_info, processed_dir) for folder, diff_info in all_tasks]
         
         for future in as_completed(futures):
-            dist, map_id, status = future.result()
+            dist, base_name, status = future.result()
             
             if status == "success":
-                print(f"Processado: {map_id}")
-                total_vertical_distribution.update(dist)
+                print(f"Processado: {base_name}")
                 processed_count += 1
             elif status == "already_processed":
                 skipped_count += 1
             elif status == "read_error":
-                # Silencioso para não poluir o log, mas pode ser ativado para debug
-                # print(f"Ignorando {map_id} (erro na leitura ou dados faltando)")
+                print(f"  Falha ao ler dados para {base_name}")
                 error_count += 1
             elif status.startswith("fatal_error"):
-                print(f"Erro fatal em {map_id}: {status}")
+                print(f"Erro fatal em {base_name}: {status}")
                 error_count += 1
 
-    print(f"\nConcluído! {processed_count} mapas processados, {skipped_count} pulados, {error_count} com erro.")
+    print(f"\nConcluído! {processed_count} dificuldades processadas, {skipped_count} puladas, {error_count} com erro.")
 
 if __name__ == "__main__":
     preprocess_all(max_workers=os.cpu_count() or 4)

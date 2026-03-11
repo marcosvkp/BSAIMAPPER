@@ -2,154 +2,121 @@ import math
 
 class FlowFixer:
     """
-    Simulador de Paridade e Corretor de Flow (V6 - Resets Longos e Seguros).
-    Foco: Bombas apenas em pausas longas e reentrada correta (Down Cut).
+    Simulador de Paridade Estrita (V7).
+    Foco: Garantir fluxo ABAB (Cima/Baixo) contínuo e corrigir streams quebrados.
+    Removeu-se a geração agressiva de bombas em favor de inverter notas erradas.
     """
 
-    # Constantes
+    # Constantes de Direção
     UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
     UP_LEFT, UP_RIGHT, DOWN_LEFT, DOWN_RIGHT = 4, 5, 6, 7
     DOT = 8
-    LEFT_HAND, RIGHT_HAND = 0, 1
+    
+    LEFT_HAND = 0
+    RIGHT_HAND = 1
     BOMB = 3
 
     @staticmethod
     def fix(notes, bpm):
         if not notes: return []
-        notes.sort(key=lambda x: x['_time'])
         
-        left = [n for n in notes if n['_type'] == FlowFixer.LEFT_HAND]
-        right = [n for n in notes if n['_type'] == FlowFixer.RIGHT_HAND]
+        # Separa por cor/mão
+        left_notes = [n for n in notes if n['_type'] == FlowFixer.LEFT_HAND]
+        right_notes = [n for n in notes if n['_type'] == FlowFixer.RIGHT_HAND]
+        bombs = [n for n in notes if n['_type'] == FlowFixer.BOMB] # Mantém bombas originais se houver
         
-        fixed_left, resets_left = FlowFixer._process_hand(left, bpm, FlowFixer.LEFT_HAND)
-        fixed_right, resets_right = FlowFixer._process_hand(right, bpm, FlowFixer.RIGHT_HAND)
+        # Processa cada mão independentemente
+        fixed_left = FlowFixer._process_hand_strict(left_notes, FlowFixer.LEFT_HAND)
+        fixed_right = FlowFixer._process_hand_strict(right_notes, FlowFixer.RIGHT_HAND)
         
-        # Unifica os tempos de reset
-        all_resets = sorted(list(set(resets_left + resets_right)))
-        
-        # Gera Parede de Bombas Global (4 colunas)
-        bombs = []
-        for t in all_resets:
-            for col in range(4): 
-                bombs.append({
-                    "_time": t,
-                    "_lineIndex": col,
-                    "_lineLayer": 0, # Chão
-                    "_type": FlowFixer.BOMB,
-                    "_cutDirection": 0
-                })
-
+        # Junta tudo e reordena
         all_obj = fixed_left + fixed_right + bombs
         all_obj.sort(key=lambda x: x['_time'])
         return all_obj
 
     @staticmethod
-    def _process_hand(hand_notes, bpm, hand_type):
-        if not hand_notes: return [], []
-
+    def _process_hand_strict(hand_notes, hand_type):
+        if not hand_notes: return []
+        
+        hand_notes.sort(key=lambda x: x['_time'])
         processed = []
-        resets = []
-        sec_per_beat = 60 / bpm
         
-        # --- REGRA DE OURO: TEMPO MÍNIMO PARA BOMBA ---
-        # Só gera bomba se houver um buraco de pelo menos 3.0 segundos (ex: 1.5s antes, 1.5s depois)
-        BOMB_THRESHOLD = 3.0 
-
-        prev_ended_up = False 
-        prev_note = hand_notes[0]
+        # Estado inicial: assumimos que a mão começa em baixo (neutro), então a primeira nota idealmente corta pra CIMA.
+        # Se a primeira nota for pra BAIXO, ok, aceitamos, mas definimos o estado de acordo.
         
-        prev_note = FlowFixer._sanitize_note(prev_note, hand_type)
-        processed.append(prev_note)
-
-        if prev_note['_cutDirection'] in [0, 4, 5]: prev_ended_up = True
+        # True = Mão terminou em CIMA (precisa descer)
+        # False = Mão terminou em BAIXO (precisa subir)
+        last_ended_high = False 
+        
+        # Ajuste inicial baseado na primeira nota
+        first_cut = hand_notes[0]['_cutDirection']
+        if first_cut in [0, 4, 5]: last_ended_high = True # Cortou pra cima, mão tá em cima
+        elif first_cut in [1, 6, 7]: last_ended_high = False # Cortou pra baixo, mão tá em baixo
+        
+        processed.append(hand_notes[0])
         
         for i in range(1, len(hand_notes)):
+            prev_note = processed[-1]
             curr_note = hand_notes[i]
-            time_diff = (curr_note['_time'] - prev_note['_time']) * sec_per_beat
             
-            curr_note = FlowFixer._sanitize_note(curr_note, hand_type)
-            curr_cut = curr_note['_cutDirection']
+            # --- Sanitização Básica (Evitar cortes para fora nas pontas) ---
+            line = curr_note['_lineIndex']
+            cut = curr_note['_cutDirection']
             
-            # --- PROTEÇÃO DE STREAM (NOVO) ---
-            # Se as notas estão muito próximas (< 0.25s), confia no gerador.
-            # Streams rápidos geralmente já vêm com paridade correta (cima/baixo/cima/baixo).
-            if time_diff < 0.25:
-                processed.append(curr_note)
-                prev_note = curr_note
-                # Atualiza estado baseado no corte atual
-                if curr_cut in [0, 4, 5]: prev_ended_up = True
-                elif curr_cut in [1, 6, 7]: prev_ended_up = False
-                continue
+            if hand_type == 0 and line == 0 and cut in [3, 5, 7]: curr_note['_cutDirection'] = 8 # Esq canto esq cortando pra esq -> DOT
+            if hand_type == 1 and line == 3 and cut in [2, 4, 6]: curr_note['_cutDirection'] = 8 # Dir canto dir cortando pra dir -> DOT
 
-            # Determina intenção atual
-            curr_goes_up = False
-            if curr_cut in [0, 4, 5]: curr_goes_up = True
-            elif curr_cut in [1, 6, 7]: curr_goes_up = False
-            elif curr_cut == 8: curr_goes_up = curr_note['_lineLayer'] >= 1
-            else: curr_goes_up = prev_ended_up 
+            # --- Análise de Fluxo ---
+            # Determina a direção vertical da nota atual
+            current_goes_up = False   # Intenção de subir (Corte Cima)
+            current_goes_down = False # Intenção de descer (Corte Baixo)
+            
+            if curr_note['_cutDirection'] in [0, 4, 5]: current_goes_up = True
+            elif curr_note['_cutDirection'] in [1, 6, 7]: current_goes_down = True
+            
+            # Se for lateral ou dot, tentamos inferir baseada na posição da camada (y)
+            # Mas na dúvida, forçamos o flow oposto ao anterior
+            is_ambiguous = (not current_goes_up) and (not current_goes_down)
 
-            # Verifica necessidade de Reset (Quebra de Flow)
-            is_reset_needed = (prev_ended_up and curr_goes_up) or (not prev_ended_up and not curr_goes_up)
+            # --- Correção de Paridade ---
+            # Se a mão terminou em CIMA (last_ended_high), a próxima nota DEVE ser para baixo (ou neutra que permita descer)
+            # Se a mão terminou em BAIXO (!last_ended_high), a próxima nota DEVE ser para cima
+            
+            must_go_down = last_ended_high
+            
+            fix_applied = False
+            
+            if must_go_down:
+                # Esperamos um corte para BAIXO.
+                if current_goes_up:
+                    # ERRO: Mão tá em cima e nota pede pra cortar pra cima.
+                    # Correção: Inverter para Baixo
+                    curr_note['_cutDirection'] = 1 # Down
+                    fix_applied = True
+                elif is_ambiguous:
+                    # Se é lateral/dot e precisamos descer, forçamos um viés de descida se necessário, 
+                    # mas geralmente dots aceitam qualquer fluxo. Mantemos o dot.
+                    pass
+            else:
+                # Esperamos um corte para CIMA.
+                if current_goes_down:
+                    # ERRO: Mão tá em baixo e nota pede pra cortar pra baixo.
+                    # Correção: Inverter para Cima
+                    curr_note['_cutDirection'] = 0 # Up
+                    fix_applied = True
+                elif is_ambiguous:
+                    pass
 
-            # Lógica de Decisão: Corrigir ou Resetar?
-            if is_reset_needed:
-                if time_diff < BOMB_THRESHOLD:
-                    # --- CASO 1: Intervalo Curto/Médio -> CORRIGIR NOTA ---
-                    # Não há tempo para reset confortável com bomba.
-                    # Solução: Inverter a nota para manter o flow contínuo.
-                    new_cut = FlowFixer._get_inverse_cut(curr_cut)
-                    
-                    if FlowFixer._is_bad_angle(new_cut, curr_note['_lineIndex'], hand_type):
-                        curr_note['_cutDirection'] = 8 # Dot
-                    else:
-                        curr_note['_cutDirection'] = new_cut
-                    
-                    # O flow foi corrigido, então a intenção inverteu
-                    curr_goes_up = not prev_ended_up 
-
-                else:
-                    # --- CASO 2: Intervalo Longo (> 3s) -> RESET COM BOMBA ---
-                    bomb_time = (prev_note['_time'] + curr_note['_time']) / 2
-                    resets.append(bomb_time)
-                    
-                    # --- CORREÇÃO DE REENTRADA (CRÍTICO) ---
-                    # Se houve bomba no chão, o jogador levantou a mão.
-                    # A próxima nota TEM que ser um corte para BAIXO (ou Dot).
-                    # Se for corte para CIMA, é impossível (braço já está em cima).
-                    if curr_goes_up: # Se a nota original era pra cima
-                        # Força para baixo
-                        curr_note['_cutDirection'] = 1 # Down
-                        curr_goes_up = False # Agora vai pra baixo
+            # --- Atualiza o estado para a próxima iteração ---
+            # Recalcula a direção final da nota (pode ter sido alterada pelo fix)
+            final_cut = curr_note['_cutDirection']
+            
+            if final_cut in [0, 4, 5]: last_ended_high = True
+            elif final_cut in [1, 6, 7]: last_ended_high = False
+            else:
+                # Se for DOT ou Lateral, assume que o fluxo continuou e inverteu a posição
+                last_ended_high = not last_ended_high 
             
             processed.append(curr_note)
-            prev_note = curr_note
-            prev_ended_up = curr_goes_up
 
-        return processed, resets
-
-    @staticmethod
-    def _sanitize_note(note, hand):
-        line = note['_lineIndex']
-        cut = note['_cutDirection']
-        
-        # Remove laterais no meio
-        if line in [1, 2] and cut in [2, 3]:
-            note['_cutDirection'] = 8
-            return note
-
-        # Remove cortes para fora nas pontas
-        if hand == 0 and line == 0 and cut in [3, 5, 7]: note['_cutDirection'] = 8
-        if hand == 1 and line == 3 and cut in [2, 4, 6]: note['_cutDirection'] = 8
-        
-        return note
-
-    @staticmethod
-    def _get_inverse_cut(cut):
-        pairs = {0:1, 1:0, 2:3, 3:2, 4:7, 5:6, 6:5, 7:4}
-        return pairs.get(cut, 8)
-
-    @staticmethod
-    def _is_bad_angle(cut, line, hand):
-        if hand == 0 and line == 0 and cut in [3, 5, 7]: return True
-        if hand == 1 and line == 3 and cut in [2, 4, 6]: return True
-        return False
+        return processed

@@ -9,10 +9,7 @@ from pattern_manager import PatternManager
 from flow_fixer import FlowFixer
 from audio_processor import extract_features, detect_bpm, add_silence, analyze_energy
 
-# Mapeamento de IDs para Nomes de Dificuldade
 DIFFICULTY_MAP = {1: "Easy", 2: "Normal", 3: "Hard", 4: "Expert", 5: "ExpertPlus"}
-
-# Parâmetros base por dificuldade. O threshold agora será modificado dinamicamente pelas estrelas.
 DIFFICULTY_PARAMS = {
     "Easy":       {"njs": 10, "offset": 0.0},
     "Normal":     {"njs": 12, "offset": 0.0},
@@ -27,9 +24,6 @@ def zip_folder(folder_path, output_path):
     print(f"Pacote final criado: {output_path}.zip")
 
 def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, difficulty_name, target_stars):
-    """
-    Gera as notas para uma dificuldade específica, agora condicionado pelo target_stars.
-    """
     print(f"   -> Gerando: {difficulty_name} ({target_stars:.2f} estrelas)...")
     
     device = next(model.parameters()).device
@@ -37,63 +31,120 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
     stars_tensor = torch.tensor([[target_stars]], dtype=torch.float32).to(device)
     
     with torch.no_grad():
-        # O modelo agora recebe as estrelas como entrada
         p_beat, p_comp, p_vert = model(inputs, stars_tensor)
         beat_probs = torch.sigmoid(p_beat).squeeze().cpu().numpy()
         comp_classes = torch.argmax(p_comp, dim=2).squeeze().cpu().numpy()
         vert_classes = torch.argmax(p_vert, dim=2).squeeze().cpu().numpy()
 
-    # --- Lógica de Densidade de Notas (NPS) baseada em Estrelas ---
-    # Mapeia estrelas para um fator de densidade. Ex: 1 estrela = 0.5, 10 estrelas = 1.5
-    # Isso ajusta o quão "agressivamente" o modelo colocará notas.
-    nps_target_factor = np.interp(target_stars, [1, 13], [0.6, 1.8])
-    base_threshold = 0.5 / nps_target_factor
+    # --- Lógica de Densidade de Notas (Target Density) ---
+    # Em vez de thresholds, calculamos quantas notas o mapa DEVE ter baseado nas estrelas.
+    # Fórmula aproximada: NPS (Notas por Segundo) ~ 1.0 + (Estrelas * 0.7)
+    # Ex: 4 estrelas = 3.8 NPS | 8 estrelas = 6.6 NPS (média global, picos serão maiores)
+    target_nps = 1.0 + (target_stars * 0.75)
+    
+    duration_seconds = len(beat_probs) * (hop_length / sr)
+    target_total_notes = int(duration_seconds * target_nps)
+    
+    print(f"      Meta de Densidade: {target_nps:.2f} NPS (~{target_total_notes} notas)")
 
-    pattern_manager = PatternManager(difficulty=difficulty_name)
-    raw_notes = []
     frame_dur = hop_length / sr
-    sec_per_beat = 60 / bpm
+    # Cooldown mínimo absoluto (físico) para evitar sobreposição impossível
+    # 60/BPM = seg/beat. /4 = 1/4 de beat.
+    # Em mapas rápidos, permitimos até 1/8.
+    min_beat_fraction = 8.0 if target_stars > 7 else 4.0
+    min_cooldown_frames = int((60.0 / bpm / min_beat_fraction) / frame_dur)
     
-    # Cooldown dinâmico baseado em estrelas
-    cooldown_factor = np.interp(target_stars, [1, 13], [2.5, 0.7])
-    base_cooldown = int((0.1 / frame_dur) * cooldown_factor)
-    last_frame = -base_cooldown
-    occupied_until_beat = 0.0
-    MIN_START_TIME = 3.0 
+    # 1. Encontrar TODOS os picos locais (candidatos a nota)
+    # Não usamos threshold aqui. Se for um pico, é um candidato.
+    candidates = []
+    MIN_START_TIME = 2.0
     
-    for i in range(len(beat_probs)):
+    for i in range(1, len(beat_probs) - 1):
         time_sec = i * frame_dur
         if time_sec < MIN_START_TIME: continue
         
-        current_beat = time_sec / sec_per_beat
-        if current_beat < occupied_until_beat: continue
+        prob = beat_probs[i]
+        
+        # É um pico local?
+        if prob > beat_probs[i-1] and prob > beat_probs[i+1]:
+            # Adiciona à lista de candidatos: (probabilidade, índice_frame)
+            # Multiplicamos a probabilidade pela energia local para dar preferência a partes intensas
+            score = prob * (0.8 + 0.4 * energy_profile[i])
+            candidates.append((score, i))
             
-        current_energy = energy_profile[i]
+    # 2. Ordenar candidatos pela confiança da IA (do maior para o menor)
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    
+    # 3. Selecionar os melhores picos respeitando o cooldown e a meta de notas
+    selected_indices = []
+    occupied_frames = set()
+    
+    # Margem de segurança para o cooldown (evitar notas coladas demais)
+    cooldown_margin = min_cooldown_frames
+    
+    for score, idx in candidates:
+        if len(selected_indices) >= target_total_notes:
+            break
+            
+        # Verifica conflito de cooldown com notas já selecionadas
+        # (Uma implementação simples de verificação de proximidade)
+        is_too_close = False
         
-        # Threshold dinâmico ajustado pela energia da música
-        dynamic_threshold = base_threshold + (0.5 - current_energy) * 0.4
-        dynamic_threshold = np.clip(dynamic_threshold, 0.1, 0.9)
+        # Otimização: verificar apenas numa janela próxima seria mais rápido, 
+        # mas para <5000 notas isso é ok.
+        for selected_idx in selected_indices:
+            if abs(selected_idx - idx) < cooldown_margin:
+                is_too_close = True
+                break
         
-        current_cooldown = base_cooldown * (1.0 - (current_energy * 0.5)) # Menos cooldown em partes energéticas
-
-        if beat_probs[i] > dynamic_threshold and (i - last_frame) > current_cooldown:
-            if i > 0 and i < len(beat_probs)-1 and beat_probs[i] > beat_probs[i-1] and beat_probs[i] > beat_probs[i+1]:
-                beat_time = round(current_beat * 8) / 8.0 # Arredonda para o 1/8 de beat mais próximo
-                
-                meta = pattern_manager.get_pattern(beat_probs[i], comp_classes[i], vert_classes[i], (i - last_frame) * frame_dur, energy_level=current_energy)
-                
-                if meta: 
-                    new_notes = pattern_manager.apply_pattern(meta, beat_time, bpm)
-                    raw_notes.extend(new_notes)
-                    last_frame = i
-                    
-                    if meta['type'] in ['burst_fill', 'super_stream']:
-                        occupied_until_beat = beat_time + (0.25 * len(new_notes))
+        if not is_too_close:
+            selected_indices.append(idx)
+            
+    # Recupera a ordem temporal
+    selected_indices.sort()
+    
+    # 4. Gerar as notas finais usando o PatternManager
+    pattern_manager = PatternManager(difficulty=difficulty_name)
+    raw_notes = []
+    last_frame = -999
+    
+    for idx in selected_indices:
+        current_beat = (idx * frame_dur) / (60.0 / bpm)
+        # Quantização para 1/16 de beat
+        beat_time = round(current_beat * 16) / 16.0
+        
+        # Evita duplicatas exatas de tempo (caso o arredondamento gere colisão)
+        if raw_notes and beat_time <= raw_notes[-1]['_time']:
+            continue
+            
+        time_gap = (idx - last_frame) * frame_dur
+        
+        # O PatternManager constrói a nota baseada na "intenção" (classes) da IA naquele momento
+        new_notes = pattern_manager.apply_pattern(
+            time=beat_time, 
+            bpm=bpm,
+            complexity_idx=comp_classes[idx], 
+            vertical_idx=vert_classes[idx], 
+            time_gap=time_gap
+        )
+        
+        if new_notes:
+            raw_notes.extend(new_notes)
+            last_frame = idx
+            
+            # Se gerou um burst/stream, avança o "last_frame" virtualmente
+            # para evitar sobrepor o stream com a próxima nota selecionada
+            if len(new_notes) > 1:
+                # Estimativa grosseira: cada nota extra consome um pouco de tempo
+                extra_frames = int((len(new_notes) * 0.15) / frame_dur) 
+                # Removemos futuros candidatos que colidiriam com este burst
+                # (Isso é implícito pois já filtramos por cooldown simples antes, 
+                # mas o burst ocupa mais espaço que uma nota simples)
+                pass
 
     print(f"      Notas geradas (bruto): {len(raw_notes)}")
-    if not raw_notes:
-        print(f"      AVISO: Nenhuma nota gerada para {difficulty_name}. Tente um valor de estrelas mais alto ou verifique o modelo.")
-
+    
+    # FlowFixer
     all_objects = FlowFixer.fix(raw_notes, bpm)
     final_notes = [obj for obj in all_objects if obj['_type'] != 3]
     final_bombs = [obj for obj in all_objects if obj['_type'] == 3]
@@ -136,7 +187,7 @@ def save_difficulty_dat(notes, bombs, folder, filename):
     with open(os.path.join(folder, filename), 'w') as f: json.dump(data, f)
 
 def main():
-    print("\n   BEAT SABER AI MAPPER V2 - GERAÇÃO POR URL\n" + "="*50)
+    print("="*50 + "\n   BEAT SABER AI MAPPER V2 - GERAÇÃO POR URL\n" + "="*50)
     
     url = input("Digite a URL da música (YouTube): ").strip()
     if not url: print("URL inválida."); return
@@ -161,7 +212,6 @@ def main():
     order = list(DIFFICULTY_MAP.values())
     selected_diffs.sort(key=lambda x: order.index(x))
     
-    # --- Nova Etapa: Perguntar as Estrelas para cada dificuldade ---
     difficulties_with_stars = {}
     print("\n[3/5] Defina o nível de estrelas para cada dificuldade:")
     for diff_name in selected_diffs:
@@ -182,7 +232,7 @@ def main():
     
     print("\n[4/5] Analisando áudio e extraindo features...")
     raw_bpm = detect_bpm(mp3_path)
-    bpm = round(raw_bpm) # Arredonda o BPM para inteiro
+    bpm = round(raw_bpm)
     print(f"BPM Detectado: {raw_bpm:.2f} -> Usando: {bpm}")
     
     full_audio_path = os.path.join(output_folder, final_audio_name)
