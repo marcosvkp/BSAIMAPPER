@@ -12,7 +12,10 @@ class FlowState:
 
 
 class PatternManager:
-    """Traduz intenções da IA em padrões com foco de jogabilidade."""
+    """
+    Traduz as intenções da IA em notas concretas.
+    A diversidade é guiada por contexto (tempo + estado), evitando aleatoriedade pura.
+    """
 
     def __init__(self, difficulty="ExpertPlus"):
         self.left = FlowState(0)
@@ -26,40 +29,36 @@ class PatternManager:
             seed += int(abs(val) * 1000) * (i * 31)
         return seed % modulo
 
-    def _is_dense_window(self, bpm, time_gap, star_level):
-        beat_gap = time_gap / (60.0 / bpm)
-        if star_level >= 5.5:
-            return beat_gap <= 0.35
-        return beat_gap <= 0.25
-
-    def apply_pattern(self, time, bpm, complexity_idx, vertical_idx, time_gap, intensity=0.5, star_level=6.0):
+    def apply_pattern(
+        self,
+        time,
+        bpm,
+        complexity_idx,
+        vertical_idx,
+        time_gap,
+        intensity=0.5,
+        star_level=6.0,
+    ):
         notes = []
-        dense_window = self._is_dense_window(bpm, time_gap, star_level)
 
-        is_stream = complexity_idx == 2 and dense_window
-        wants_double = complexity_idx >= 1 and intensity > 0.68 and not dense_window
-        can_tower = complexity_idx == 2 and intensity > 0.78 and time_gap > (60.0 / bpm) * 0.45
+        is_stream = complexity_idx == 2 and time_gap < (60 / bpm) * 0.45
+        wants_double = complexity_idx >= 1 and intensity > 0.6
+        high_density = (star_level >= 6.5 and intensity > 0.7) or complexity_idx == 2
 
         if is_stream:
             notes = self._gen_stream_note(time, vertical_idx)
-        elif star_level >= 5.5 and wants_double:
-            # Dificuldade alta: privilegia singulares fluídas e doubles espaçados
-            if self._context_index(100, time, intensity, star_level) < 14:
-                notes = self._gen_double_note(time, vertical_idx, intensity)
-            else:
-                notes = self._gen_single_note(time, vertical_idx, intensity)
+        elif high_density and wants_double and self._context_index(100, time, intensity) < 35:
+            notes = self._gen_double_note(time, vertical_idx, intensity)
         elif complexity_idx == 0:
             notes = self._gen_single_note(time, vertical_idx, intensity)
         elif complexity_idx == 1:
-            if not dense_window and self._context_index(12, time, vertical_idx, intensity) < 3:
+            if self._context_index(10, time, vertical_idx, intensity) < 3:
                 notes = self._gen_wide_note(time, vertical_idx)
             else:
                 notes = self._gen_single_note(time, vertical_idx, intensity)
         else:
-            if can_tower and self._context_index(16, time, time_gap, intensity) < 2:
+            if self._context_index(10, time, time_gap, intensity) < 2:
                 notes = self._gen_tower_stack(time)
-            elif not dense_window and self._context_index(100, time, intensity, vertical_idx) < 20:
-                notes = self._gen_double_note(time, vertical_idx, intensity)
             else:
                 notes = self._gen_single_note(time, vertical_idx, intensity)
 
@@ -86,14 +85,16 @@ class PatternManager:
             base = [1, 2, 2]
         else:
             base = [0, 1, 1, 2]
+
         idx = self._context_index(len(base), time, intensity, hand, v_bias)
         return base[idx]
 
     def _pick_line(self, hand, intensity, time, spread_bias):
         if hand == 0:
-            pool = [0, 1] if spread_bias < 0.55 else [0, 1, 2]
+            pool = [0, 1] if spread_bias < 0.5 else [0, 1, 2]
         else:
-            pool = [2, 3] if spread_bias < 0.55 else [1, 2, 3]
+            pool = [2, 3] if spread_bias < 0.5 else [1, 2, 3]
+
         idx = self._context_index(len(pool), time, intensity, spread_bias)
         return pool[idx]
 
@@ -101,8 +102,8 @@ class PatternManager:
         hand = self.parity
         line = self._pick_line(hand, intensity, time, spread_bias=intensity)
         layer = self._pick_layer(v_bias, hand, intensity, time)
-        state = self.right if hand == 1 else self.left
 
+        state = self.right if hand == 1 else self.left
         if layer > state.y:
             cut = 0
         elif layer < state.y:
@@ -110,14 +111,20 @@ class PatternManager:
         else:
             cut = 0 if self._context_index(2, time, state.cut, hand) == 0 else 1
 
-        if self._context_index(14, time, intensity, hand, v_bias) > 11:
+        if self._context_index(10, time, intensity, hand, v_bias) > 7:
             cut = 4 if hand == 0 else 5
         return self._create_note(hand, time, line, layer, cut)
 
     def _gen_stream_note(self, time, v_bias):
         hand = self.parity
         state = self.right if hand == 1 else self.left
-        layer = 0 if v_bias == 0 else 1 if v_bias == 1 else 2
+
+        if v_bias == 0:
+            layer = 0
+        elif v_bias == 2:
+            layer = 1
+        else:
+            layer = 1
 
         line_pool = [1, 2] if state.x in [0, 3] else [state.x, 1 if hand == 0 else 2]
         line = line_pool[self._context_index(len(line_pool), time, state.x, state.y)]
@@ -132,7 +139,7 @@ class PatternManager:
         return self._create_note(hand, time, line, layer, cut)
 
     def _gen_double_note(self, time, v_bias, intensity):
-        if intensity > 0.82:
+        if intensity > 0.78:
             l_line, r_line = 0, 3
         else:
             l_line, r_line = 1, 2

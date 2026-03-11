@@ -42,7 +42,9 @@ def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, di
     # A densidade é guiada principalmente pela confiança média da IA,
     # com as estrelas atuando como ajuste suave (não uma regra bruta).
     ai_conf = float(np.mean(beat_probs))
-    target_nps = compute_target_nps(ai_conf, target_stars)
+    base_nps = 1.2 + ai_conf * 6.5
+    star_boost = 1.0 + np.clip((target_stars - 5.0) * 0.08, -0.2, 0.4)
+    target_nps = base_nps * star_boost
 
     duration_seconds = len(beat_probs) * (hop_length / sr)
     target_total_notes = int(max(80, duration_seconds * target_nps))

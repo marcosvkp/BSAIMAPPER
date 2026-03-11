@@ -21,7 +21,7 @@ def _select_note_frames(beat_probs, energy_profile, bpm, frame_dur, target_stars
     peaks = []
     for i in range(1, len(beat_probs) - 1):
         if beat_probs[i] > beat_probs[i - 1] and beat_probs[i] > beat_probs[i + 1]:
-            score = candidate_score(beat_probs[i], energy_profile[i])
+            score = beat_probs[i] * (0.7 + 0.6 * energy_profile[i])
             peaks.append((score, i))
 
     if not peaks:
@@ -29,12 +29,14 @@ def _select_note_frames(beat_probs, energy_profile, bpm, frame_dur, target_stars
 
     # Densidade alvo guiada pela IA + ajuste suave por estrelas (sem regra rígida)
     ai_conf = float(np.mean(beat_probs))
-    target_nps = compute_target_nps(ai_conf, target_stars)
+    base_nps = 1.2 + ai_conf * 6.5
+    star_boost = 1.0 + np.clip((target_stars - 5.0) * 0.08, -0.2, 0.4)
+    target_nps = base_nps * star_boost
 
     duration_seconds = len(beat_probs) * frame_dur
     target_total_notes = int(max(80, duration_seconds * target_nps))
 
-    min_fraction = compute_min_beat_fraction(target_stars)
+    min_fraction = 8.0 if target_stars >= 7.0 else 4.0
     cooldown_frames = max(1, int((60.0 / bpm / min_fraction) / frame_dur))
 
     peaks.sort(key=lambda x: x[0], reverse=True)
@@ -108,7 +110,6 @@ def generate_map_optimized(audio_path, output_folder, target_stars=7.0):
     )
 
     print(f"Gerando com Director AI (estrelas={target_stars:.2f})...")
-    logger.log("selection", selected_frames=len(selected_indices), bpm=bpm)
 
     last_frame = -99999
     for idx in selected_indices:
@@ -134,16 +135,6 @@ def generate_map_optimized(audio_path, output_folder, target_stars=7.0):
         if new_notes:
             raw_notes.extend(new_notes)
             last_frame = idx
-
-    if raw_notes:
-        times = sorted(n["_time"] for n in raw_notes)
-        min_gap = min((b - a) for a, b in zip(times, times[1:])) if len(times) > 1 else 0.0
-        duration_beats = max(times[-1] - times[0], 0.001)
-        effective_nps = len(raw_notes) / ((duration_beats * 60.0) / bpm)
-    else:
-        min_gap = 0.0
-        effective_nps = 0.0
-    logger.log("raw_generation", notes=len(raw_notes), min_gap_beats=min_gap, effective_nps=effective_nps)
 
     print("Aplicando FlowFixer (Simulação de Paridade e Resets)...")
     all_objects = FlowFixer.fix(raw_notes, bpm)
