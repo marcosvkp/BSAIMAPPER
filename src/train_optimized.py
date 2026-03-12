@@ -1,90 +1,68 @@
 import os
-import math
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 import numpy as np
 from collections import defaultdict
-from models_optimized import get_model
+from models_optimized import (
+    get_timing_model, get_note_model, get_flow_model,
+    NOTE_HISTORY, NOTE_FEATURES, FLOW_CONTEXT
+)
 
 # ─────────────────────────────────────────────────────────────────
-# Parâmetros de Treinamento
+# Parâmetros
 # ─────────────────────────────────────────────────────────────────
-BATCH_SIZE    = 256
-SEQ_LEN       = 512   # +50 frames de contexto vs versão anterior
-EPOCHS        = 60    # +20 épocas: loss ainda estava caindo no epoch 40
-LEARNING_RATE = 0.0007
-NUM_WORKERS   = os.cpu_count() or 4
+PROCESSED_DIR  = "data/processed"
+MODELS_DIR     = "models"
+BATCH_SIZE     = 256
+SEQ_LEN        = 512
+EPOCHS_TIMING  = 60
+EPOCHS_NOTE    = 80
+EPOCHS_FLOW    = 50
+LEARNING_RATE  = 0.0007
+NUM_WORKERS    = 6
 
-# Balanceamento: faixas de estrelas e peso relativo de cada faixa.
-# Faixas altas recebem peso maior para compensar sub-representação no dataset.
 STAR_BINS = [
-    (0.0,  4.0, 1.0),   # Fácil       — peso normal
-    (4.0,  5.5, 1.2),   # Moderado    — leve boost
-    (5.5,  7.0, 2.0),   # Difícil     — boost médio
-    (7.0,  9.0, 3.0),   # Muito difícil — boost alto
-    (9.0, 99.0, 4.0),   # Extremo     — boost máximo
+    (0.0,  4.0, 1.0),
+    (4.0,  5.5, 1.2),
+    (5.5,  7.0, 2.0),
+    (7.0,  9.0, 3.0),
+    (9.0, 99.0, 4.0),
 ]
 
-# Peso da loss de diversidade de posição.
-# 0.15 era pequeno demais — o modelo ignorava essa penalidade.
-# 0.50 coloca Div na mesma ordem de grandeza que Comp e Vert (~0.5 cada),
-# forçando o modelo a realmente aprender a variar padrões.
-DIVERSITY_LOSS_WEIGHT = 0.50
-# Janela de frames para verificar repetição de posição (complexity/vertical)
-DIVERSITY_WINDOW = 8
-
-
 # ─────────────────────────────────────────────────────────────────
-# Dataset com leitura de estrelas antecipada para balanceamento
+# Dataset TimingNet  (inalterado)
 # ─────────────────────────────────────────────────────────────────
 
-class DirectorDataset(Dataset):
+class TimingDataset(Dataset):
     def __init__(self, processed_dir, seq_len):
         self.processed_dir = processed_dir
-        self.seq_len = seq_len
-
-        all_bases = list(set([
+        self.seq_len       = seq_len
+        bases = list(set([
             f.replace('_x.npy', '')
             for f in os.listdir(processed_dir)
             if f.endswith('_x.npy')
         ]))
-
-        # Carrega as estrelas de cada arquivo para construir os pesos de amostragem
-        self.files = []
-        self.star_values = []
-
-        print("  Escaneando estrelas do dataset para balanceamento...")
-        for base in all_bases:
-            stars_path = os.path.join(processed_dir, f"{base}_stars.npy")
-            if not os.path.exists(stars_path):
+        self.files, self.stars = [], []
+        for base in bases:
+            sp = os.path.join(processed_dir, f"{base}_stars.npy")
+            tp = os.path.join(processed_dir, f"{base}_timing.npy")
+            if not os.path.exists(sp) or not os.path.exists(tp):
                 continue
             try:
-                stars_val = float(np.load(stars_path).item())
+                self.stars.append(float(np.load(sp).item()))
                 self.files.append(base)
-                self.star_values.append(stars_val)
             except Exception:
                 continue
-
-        self.star_values = np.array(self.star_values, dtype=np.float32)
-        self._print_star_distribution()
-
-    def _print_star_distribution(self):
-        print("  Distribuição do dataset por faixa de estrelas:")
-        for lo, hi, _ in STAR_BINS:
-            count = int(np.sum((self.star_values >= lo) & (self.star_values < hi)))
-            label = f"  {lo:.1f}★ – {hi:.1f}★" if hi < 90 else f"  {lo:.1f}★+"
-            print(f"    {label}: {count} dificuldades")
+        self.stars = np.array(self.stars, dtype=np.float32)
+        print(f"  TimingDataset: {len(self.files)} dificuldades")
 
     def get_sample_weights(self):
-        """
-        Retorna um peso por amostra para uso no WeightedRandomSampler.
-        Amostras de faixas de estrelas altas recebem peso maior.
-        """
         weights = np.ones(len(self.files), dtype=np.float32)
         for lo, hi, w in STAR_BINS:
-            mask = (self.star_values >= lo) & (self.star_values < hi)
+            mask = (self.stars >= lo) & (self.stars < hi)
             weights[mask] = w
         return weights
 
@@ -92,113 +70,288 @@ class DirectorDataset(Dataset):
         return len(self.files) * 12
 
     def __getitem__(self, idx):
-        file_base = self.files[idx % len(self.files)]
-
-        path_x    = os.path.join(self.processed_dir, f"{file_base}_x.npy")
-        path_y    = os.path.join(self.processed_dir, f"{file_base}_y.npy")
-        path_meta = os.path.join(self.processed_dir, f"{file_base}_meta.npy")
-        path_stars= os.path.join(self.processed_dir, f"{file_base}_stars.npy")
-
-        features = np.load(path_x,    mmap_mode='r')
-        targets  = np.load(path_y,    mmap_mode='r')
-        metadata = np.load(path_meta, mmap_mode='r')
-        stars    = np.load(path_stars)
-
-        total_frames = features.shape[0]
-        start = np.random.randint(0, max(1, total_frames - self.seq_len))
-        end   = start + self.seq_len
-
-        feat_crop = np.array(features[start:end])
-        targ_crop = np.array(targets[start:end])
-        comp_target = np.array(metadata[start:end, 0]).astype(np.int64)
-        vert_target = np.array(metadata[start:end, 1]).astype(np.int64)
-        beat_target = np.any(targ_crop > 0.1, axis=1).astype(np.float32).reshape(-1, 1)
-
-        pad_len = self.seq_len - feat_crop.shape[0]
-        if pad_len > 0:
-            feat_crop   = np.pad(feat_crop,   ((0, pad_len), (0, 0)))
-            beat_target = np.pad(beat_target, ((0, pad_len), (0, 0)))
-            comp_target = np.pad(comp_target, (0, pad_len), constant_values=-100)
-            vert_target = np.pad(vert_target, (0, pad_len), constant_values=-100)
-
+        base   = self.files[idx % len(self.files)]
+        feats  = np.load(os.path.join(self.processed_dir, f"{base}_x.npy"),      mmap_mode='r')
+        timing = np.load(os.path.join(self.processed_dir, f"{base}_timing.npy"), mmap_mode='r')
+        stars  = np.load(os.path.join(self.processed_dir, f"{base}_stars.npy"))
+        total  = feats.shape[0]
+        start  = np.random.randint(0, max(1, total - self.seq_len))
+        end    = start + self.seq_len
+        feat_c   = np.array(feats[start:end])
+        timing_c = np.array(timing[start:end]).reshape(-1, 1)
+        pad = self.seq_len - feat_c.shape[0]
+        if pad > 0:
+            feat_c   = np.pad(feat_c,   ((0, pad), (0, 0)))
+            timing_c = np.pad(timing_c, ((0, pad), (0, 0)))
         return (
-            torch.tensor(feat_crop,   dtype=torch.float32),
-            torch.tensor(beat_target, dtype=torch.float32),
-            torch.tensor(comp_target, dtype=torch.long),
-            torch.tensor(vert_target, dtype=torch.long),
+            torch.tensor(feat_c,   dtype=torch.float32),
+            torch.tensor(timing_c, dtype=torch.float32),
             torch.tensor([stars.item()], dtype=torch.float32),
         )
 
 
 # ─────────────────────────────────────────────────────────────────
-# Loss de Diversidade de Posição
+# Dataset NoteNet  (inalterado)
 # ─────────────────────────────────────────────────────────────────
 
-def diversity_loss(p_comp, p_vert, window=DIVERSITY_WINDOW):
-    """
-    Penaliza o modelo quando ele prevê a mesma classe de complexidade/vertical
-    em muitos frames consecutivos dentro de uma janela.
+PADDING_NOTE = np.array([0, 1, 0, 8], dtype=np.float32)
 
-    Intuição: mapas bons variam padrões. Se o modelo prevê "complexity=0" em
-    todos os 8 frames seguidos, é sintoma de colapso para padrão único.
+class NoteDataset(Dataset):
+    def __init__(self, processed_dir, seq_len, hop_length=512, sr=22050):
+        self.processed_dir = processed_dir
+        self.seq_len       = seq_len
+        self.frame_dur     = hop_length / sr
+        bases = list(set([
+            f.replace('_x.npy', '')
+            for f in os.listdir(processed_dir)
+            if f.endswith('_x.npy')
+        ]))
+        self.files, self.stars = [], []
+        for base in bases:
+            sp  = os.path.join(processed_dir, f"{base}_stars.npy")
+            np_ = os.path.join(processed_dir, f"{base}_notes.npy")
+            xp  = os.path.join(processed_dir, f"{base}_x.npy")
+            if not all(os.path.exists(p) for p in [sp, np_, xp]):
+                continue
+            try:
+                notes = np.load(np_)
+                if len(notes) < NOTE_HISTORY + 1:
+                    continue
+                self.stars.append(float(np.load(sp).item()))
+                self.files.append(base)
+            except Exception:
+                continue
+        self.stars = np.array(self.stars, dtype=np.float32)
+        print(f"  NoteDataset:   {len(self.files)} dificuldades")
 
-    Args:
-        p_comp: logits de complexidade  (batch, 3, seq_len)  — após permute
-        p_vert: logits de vertical      (batch, 3, seq_len)
-        window: tamanho da janela de verificação
+    def get_sample_weights(self):
+        weights = np.ones(len(self.files), dtype=np.float32)
+        for lo, hi, w in STAR_BINS:
+            mask = (self.stars >= lo) & (self.stars < hi)
+            weights[mask] = w
+        return weights
 
-    Returns:
-        Escalar de loss.
-    """
-    # Converte para probabilidades (softmax)
-    prob_comp = torch.softmax(p_comp, dim=1)  # (B, 3, T)
-    prob_vert = torch.softmax(p_vert, dim=1)
+    def __len__(self):
+        return len(self.files) * 16
 
-    batch, classes, seq = prob_comp.shape
-    if seq < window:
-        return torch.tensor(0.0, device=p_comp.device)
-
-    # Calcula a probabilidade máxima (confiança) em cada frame
-    max_comp = prob_comp.max(dim=1).values  # (B, T)
-    max_vert = prob_vert.max(dim=1).values
-
-    # Desliza uma janela e mede o quanto o modelo está "travado" na mesma classe
-    # Penalidade = variância baixa dentro da janela (= padrão repetido)
-    diversity_penalties = []
-    for t in range(0, seq - window, window // 2):
-        window_comp = max_comp[:, t:t + window]  # (B, window)
-        window_vert = max_vert[:, t:t + window]
-
-        # Entropia das predições dentro da janela — alta entropia = boa diversidade
-        # Usamos std da classe prevista como proxy simples e eficiente
-        std_comp = window_comp.std(dim=1).mean()  # escalar
-        std_vert = window_vert.std(dim=1).mean()
-
-        # Queremos std ALTA (diversidade). Penalizamos std BAIXA.
-        penalty = torch.clamp(0.5 - std_comp, min=0) + torch.clamp(0.5 - std_vert, min=0)
-        diversity_penalties.append(penalty)
-
-    if not diversity_penalties:
-        return torch.tensor(0.0, device=p_comp.device)
-
-    return torch.stack(diversity_penalties).mean()
+    def __getitem__(self, idx):
+        base      = self.files[idx % len(self.files)]
+        audio_all = np.load(os.path.join(self.processed_dir, f"{base}_x.npy"),     mmap_mode='r')
+        notes_all = np.load(os.path.join(self.processed_dir, f"{base}_notes.npy"), mmap_mode='r')
+        stars_val = float(np.load(os.path.join(self.processed_dir, f"{base}_stars.npy")).item())
+        N = len(notes_all)
+        start  = np.random.randint(0, max(1, N - self.seq_len))
+        end    = min(start + self.seq_len, N)
+        window = notes_all[start:end]
+        W = len(window)
+        audio_seq   = np.zeros((W, audio_all.shape[1]), dtype=np.float32)
+        history_seq = np.zeros((W, NOTE_HISTORY * 4),   dtype=np.float32)
+        t_hand = np.zeros(W, dtype=np.int64)
+        t_col  = np.zeros(W, dtype=np.int64)
+        t_layer= np.zeros(W, dtype=np.int64)
+        t_cut  = np.zeros(W, dtype=np.int64)
+        t_double=np.zeros(W, dtype=np.int64)
+        num_frames = audio_all.shape[0]
+        for i in range(W):
+            note = window[i]
+            beat_norm = float(note[5])
+            frame_idx = min(int(beat_norm * num_frames), num_frames - 1)
+            audio_seq[i] = audio_all[frame_idx]
+            for h in range(NOTE_HISTORY):
+                src_idx = (start + i - NOTE_HISTORY + h)
+                if src_idx < 0:
+                    history_seq[i, h*4:(h+1)*4] = PADDING_NOTE
+                else:
+                    prev = notes_all[src_idx]
+                    history_seq[i, h*4:(h+1)*4] = prev[1:5]
+            t_hand[i]  = int(note[1])
+            t_col[i]   = int(note[2])
+            t_layer[i] = int(note[3])
+            t_cut[i]   = int(note[4])
+            if i + 1 < W:
+                t_double[i] = 1 if abs(float(window[i+1][5]) - float(note[5])) < 0.02 else 0
+        pad = self.seq_len - W
+        if pad > 0:
+            audio_seq    = np.pad(audio_seq,    ((0, pad), (0, 0)))
+            history_seq  = np.pad(history_seq,  ((0, pad), (0, 0)))
+            t_hand       = np.pad(t_hand,   (0, pad), constant_values=-100)
+            t_col        = np.pad(t_col,    (0, pad), constant_values=-100)
+            t_layer      = np.pad(t_layer,  (0, pad), constant_values=-100)
+            t_cut        = np.pad(t_cut,    (0, pad), constant_values=-100)
+            t_double     = np.pad(t_double, (0, pad), constant_values=-100)
+        return (
+            torch.tensor(audio_seq,   dtype=torch.float32),
+            torch.tensor(history_seq, dtype=torch.float32),
+            torch.tensor([stars_val], dtype=torch.float32),
+            torch.tensor(t_hand,   dtype=torch.long),
+            torch.tensor(t_col,    dtype=torch.long),
+            torch.tensor(t_layer,  dtype=torch.long),
+            torch.tensor(t_cut,    dtype=torch.long),
+            torch.tensor(t_double, dtype=torch.long),
+        )
 
 
 # ─────────────────────────────────────────────────────────────────
-# Warmup + ReduceLROnPlateau combinados
+# Dataset FlowNet
+#
+# Gera exemplos de (nota perturbada → nota correta) a partir das
+# notas reais do dataset, sem precisar re-processar nada.
+#
+# Estratégia de perturbação:
+#   Para cada nota N:
+#     - Com prob PERTURB_HAND: troca a mão (target: mão original)
+#     - Com prob PERTURB_CUT:  troca o cut por um aleatório errado
+#     - Com prob PERTURB_COL:  troca a coluna por uma errada
+#   O modelo aprende a identificar e corrigir cada tipo de erro.
+#
+# Input:
+#   - Janela de FLOW_CONTEXT*2+1 notas, onde a nota central pode
+#     ter sido perturbada
+#   - Áudio local do frame da nota central
+#   - Estrelas
+#
+# Target:
+#   - hand_ok  : 1 se mão foi perturbada (deve corrigir), 0 se ok
+#   - cut_ok   : 1 se cut foi perturbado, 0 se ok
+#   - col_ok   : 1 se col foi perturbada, 0 se ok
+#   - new_hand : mão original (target quando hand_ok=1)
+#   - new_cut  : cut original  (target quando cut_ok=1)
+#   - new_col  : col original  (target quando col_ok=1)
+# ─────────────────────────────────────────────────────────────────
+
+PERTURB_HAND = 0.35
+PERTURB_CUT  = 0.45
+PERTURB_COL  = 0.25
+
+# Nota de padding para bordas da janela
+FLOW_PADDING = np.array([0, 1, 0, 8], dtype=np.float32)  # hand=L, col=1, layer=0, cut=DOT
+
+
+class FlowDataset(Dataset):
+    def __init__(self, processed_dir, hop_length=512, sr=22050):
+        self.processed_dir = processed_dir
+        self.frame_dur     = hop_length / sr
+        self.window_size   = FLOW_CONTEXT * 2 + 1
+
+        bases = list(set([
+            f.replace('_x.npy', '')
+            for f in os.listdir(processed_dir)
+            if f.endswith('_x.npy')
+        ]))
+
+        self.files, self.stars = [], []
+        for base in bases:
+            sp  = os.path.join(processed_dir, f"{base}_stars.npy")
+            np_ = os.path.join(processed_dir, f"{base}_notes.npy")
+            xp  = os.path.join(processed_dir, f"{base}_x.npy")
+            if not all(os.path.exists(p) for p in [sp, np_, xp]):
+                continue
+            try:
+                notes = np.load(np_)
+                # Precisa de ao menos uma janela completa
+                if len(notes) < self.window_size:
+                    continue
+                self.stars.append(float(np.load(sp).item()))
+                self.files.append(base)
+            except Exception:
+                continue
+
+        self.stars = np.array(self.stars, dtype=np.float32)
+        print(f"  FlowDataset:   {len(self.files)} dificuldades")
+
+    def get_sample_weights(self):
+        weights = np.ones(len(self.files), dtype=np.float32)
+        for lo, hi, w in STAR_BINS:
+            mask = (self.stars >= lo) & (self.stars < hi)
+            weights[mask] = w
+        return weights
+
+    def __len__(self):
+        return len(self.files) * 32  # mais amostras por arquivo = dataset maior
+
+    def __getitem__(self, idx):
+        base      = self.files[idx % len(self.files)]
+        audio_all = np.load(os.path.join(self.processed_dir, f"{base}_x.npy"),     mmap_mode='r')
+        notes_all = np.load(os.path.join(self.processed_dir, f"{base}_notes.npy"), mmap_mode='r')
+        stars_val = float(np.load(os.path.join(self.processed_dir, f"{base}_stars.npy")).item())
+
+        N = len(notes_all)
+        # Seleciona uma nota central aleatória (garantindo que há contexto ao redor)
+        center = np.random.randint(FLOW_CONTEXT, N - FLOW_CONTEXT)
+        center_note = notes_all[center]  # (6,): has_note, hand, col, layer, cut, beat_norm
+
+        # ── Monta a janela de contexto ────────────────────────────
+        # 9 notas × 4 valores = 36 features
+        window_flat = np.zeros(self.window_size * NOTE_FEATURES, dtype=np.float32)
+        for w in range(self.window_size):
+            note_idx = center - FLOW_CONTEXT + w
+            if 0 <= note_idx < N:
+                note = notes_all[note_idx]
+                window_flat[w*NOTE_FEATURES:(w+1)*NOTE_FEATURES] = note[1:5]  # hand,col,layer,cut
+            else:
+                window_flat[w*NOTE_FEATURES:(w+1)*NOTE_FEATURES] = FLOW_PADDING
+
+        # ── Áudio local da nota central ───────────────────────────
+        num_frames = audio_all.shape[0]
+        beat_norm  = float(center_note[5])
+        frame_idx  = min(int(beat_norm * num_frames), num_frames - 1)
+        audio_local = np.array(audio_all[frame_idx], dtype=np.float32)
+
+        # ── Valores originais (targets) ───────────────────────────
+        orig_hand  = int(center_note[1])
+        orig_col   = int(center_note[2])
+        orig_layer = int(center_note[3])
+        orig_cut   = int(center_note[4])
+
+        # ── Injeta perturbações na nota central da janela ─────────
+        center_offset = FLOW_CONTEXT * NOTE_FEATURES  # offset da nota central no vetor flat
+
+        t_hand_ok = 0  # 0 = está ok (não precisa corrigir)
+        t_cut_ok  = 0
+        t_col_ok  = 0
+
+        # Perturba mão
+        if random.random() < PERTURB_HAND:
+            wrong_hand = 1 - orig_hand  # inverte
+            window_flat[center_offset + 0] = float(wrong_hand)
+            t_hand_ok = 1  # precisa corrigir
+
+        # Perturba cut — escolhe uma direção diferente da original
+        if random.random() < PERTURB_CUT:
+            wrong_cut = random.choice([c for c in range(9) if c != orig_cut])
+            window_flat[center_offset + 3] = float(wrong_cut)
+            t_cut_ok = 1
+
+        # Perturba coluna — escolhe uma coluna diferente da original
+        if random.random() < PERTURB_COL:
+            wrong_col = random.choice([c for c in range(4) if c != orig_col])
+            window_flat[center_offset + 1] = float(wrong_col)
+            t_col_ok = 1
+
+        return (
+            torch.tensor(window_flat,  dtype=torch.float32),   # (36,)
+            torch.tensor(audio_local,  dtype=torch.float32),   # (8,)
+            torch.tensor([stars_val],  dtype=torch.float32),   # (1,)
+            torch.tensor(t_hand_ok,    dtype=torch.long),      # escalar
+            torch.tensor(t_cut_ok,     dtype=torch.long),
+            torch.tensor(t_col_ok,     dtype=torch.long),
+            torch.tensor(orig_hand,    dtype=torch.long),      # target de correção
+            torch.tensor(orig_cut,     dtype=torch.long),
+            torch.tensor(orig_col,     dtype=torch.long),
+        )
+
+
+# ─────────────────────────────────────────────────────────────────
+# Scheduler com Warmup  (inalterado)
 # ─────────────────────────────────────────────────────────────────
 
 class WarmupScheduler:
-    """
-    Aplica warmup linear por `warmup_epochs` épocas, depois delega ao scheduler base.
-    Evita gradientes explosivos no início do treino com LR alto.
-    """
-    def __init__(self, optimizer, warmup_epochs, base_lr, scheduler):
-        self.optimizer      = optimizer
-        self.warmup_epochs  = warmup_epochs
-        self.base_lr        = base_lr
-        self.scheduler      = scheduler
-        self.current_epoch  = 0
+    def __init__(self, optimizer, warmup_epochs, base_lr, plateau_scheduler):
+        self.optimizer         = optimizer
+        self.warmup_epochs     = warmup_epochs
+        self.base_lr           = base_lr
+        self.plateau_scheduler = plateau_scheduler
+        self.current_epoch     = 0
 
     def step(self, val_loss=None):
         self.current_epoch += 1
@@ -207,144 +360,266 @@ class WarmupScheduler:
             for pg in self.optimizer.param_groups:
                 pg['lr'] = lr
         elif val_loss is not None:
-            self.scheduler.step(val_loss)
+            self.plateau_scheduler.step(val_loss)
 
     def get_lr(self):
         return self.optimizer.param_groups[0]['lr']
 
 
-# ─────────────────────────────────────────────────────────────────
-# Treino principal
-# ─────────────────────────────────────────────────────────────────
-
-def train():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Usando dispositivo: {device}\n")
-
-    # ── Dataset ──────────────────────────────────────────────────
-    dataset = DirectorDataset("data/processed", seq_len=SEQ_LEN)
-
-    # WeightedRandomSampler: garante que faixas altas de estrelas apareçam
-    # proporcionalmente durante o treino, mesmo sendo minoria no dataset.
-    sample_weights = dataset.get_sample_weights()
-    # Repete os pesos para len(dataset) (que é files * 12)
-    all_weights = np.tile(sample_weights, 12)
+def _make_loader(dataset):
+    weights = dataset.get_sample_weights()
+    all_w   = np.resize(np.tile(weights, len(dataset) // len(dataset.files)), len(dataset))
     sampler = WeightedRandomSampler(
-        weights=torch.tensor(all_weights, dtype=torch.float32),
+        torch.tensor(all_w, dtype=torch.float32),
         num_samples=len(dataset),
         replacement=True,
     )
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        sampler=sampler,          # substitui shuffle=True
-        num_workers=NUM_WORKERS,
-        persistent_workers=True,
-        pin_memory=(device.type == "cuda"),
+    return DataLoader(
+        dataset, batch_size=BATCH_SIZE, sampler=sampler,
+        num_workers=NUM_WORKERS, persistent_workers=True, pin_memory=True,
     )
 
-    print(f"Total de amostras por época: {len(dataset)} | Batches: {len(dataloader)}\n")
 
-    # ── Modelo ───────────────────────────────────────────────────
-    model = get_model().to(device)
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Parâmetros treináveis: {total_params:,}\n")
+# ─────────────────────────────────────────────────────────────────
+# Treino TimingNet  (inalterado)
+# ─────────────────────────────────────────────────────────────────
 
-    # Retoma do melhor checkpoint se existir (continua de onde parou)
-    checkpoint_path = "models/director_net_v2_stars_best.pth"
-    if os.path.exists(checkpoint_path):
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        print(f"✅ Retomando do checkpoint: {checkpoint_path}\n")
-
-    # ── Otimizador & Scheduler ───────────────────────────────────
+def train_timing(device):
+    print("\n" + "="*60)
+    print("  FASE 1 — Treinando TimingNet")
+    print("="*60)
+    dataset    = TimingDataset(PROCESSED_DIR, SEQ_LEN)
+    dataloader = _make_loader(dataset)
+    model = get_timing_model().to(device)
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    ckpt = os.path.join(MODELS_DIR, "timing_net_best.pth")
+    if os.path.exists(ckpt):
+        model.load_state_dict(torch.load(ckpt, map_location=device))
+        print(f"  ✅ Retomando de {ckpt}\n")
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
-    plateau_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', patience=3, factor=0.5
-    )
-    scheduler = WarmupScheduler(
-        optimizer,
-        warmup_epochs=3,
-        base_lr=LEARNING_RATE,
-        scheduler=plateau_scheduler,
-    )
+    plateau   = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
+    scheduler = WarmupScheduler(optimizer, warmup_epochs=3, base_lr=LEARNING_RATE,
+                                plateau_scheduler=plateau)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0]).to(device))
+    print(f"{'Epoch':>6} | {'Loss':>8} | {'LR':>10}")
+    print("-" * 35)
+    best_loss = float('inf')
+    for epoch in range(EPOCHS_TIMING):
+        model.train()
+        acc_loss = 0.0
+        for feats, t_timing, t_stars in dataloader:
+            feats, t_timing, t_stars = feats.to(device), t_timing.to(device), t_stars.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(feats, t_stars), t_timing)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            acc_loss += loss.item()
+        avg = acc_loss / len(dataloader)
+        scheduler.step(avg)
+        print(f"{epoch+1:>6} | {avg:>8.4f} | {scheduler.get_lr():>10.6f}")
+        if avg < best_loss:
+            best_loss = avg
+            torch.save(model.state_dict(), ckpt)
+    torch.save(model.state_dict(), os.path.join(MODELS_DIR, "timing_net_final.pth"))
+    print(f"\n  TimingNet concluído. Melhor loss: {best_loss:.4f}")
 
-    # ── Funções de Perda ─────────────────────────────────────────
-    # pos_weight=10: penaliza falsos negativos na detecção de beat
-    # (beats são raros no sinal, ~5-15% dos frames têm nota)
-    crit_beat  = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0]).to(device))
-    crit_class = nn.CrossEntropyLoss(ignore_index=-100)
 
-    print("Iniciando Treino V3 (Balanceado por Estrelas + Diversity Loss)...\n")
-    print(f"{'Epoch':>6} | {'Loss':>8} | {'Beat':>8} | {'Comp':>8} | {'Vert':>8} | {'Div':>8} | {'LR':>10}")
-    print("-" * 75)
+# ─────────────────────────────────────────────────────────────────
+# Treino NoteNet  (inalterado)
+# ─────────────────────────────────────────────────────────────────
+
+def train_notes(device):
+    print("\n" + "="*60)
+    print("  FASE 2 — Treinando NoteNet")
+    print("="*60)
+    dataset    = NoteDataset(PROCESSED_DIR, SEQ_LEN)
+    dataloader = _make_loader(dataset)
+    model = get_note_model().to(device)
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    ckpt = os.path.join(MODELS_DIR, "note_net_best.pth")
+    if os.path.exists(ckpt):
+        model.load_state_dict(torch.load(ckpt, map_location=device))
+        print(f"  ✅ Retomando de {ckpt}\n")
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+    plateau   = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=4, factor=0.5)
+    scheduler = WarmupScheduler(optimizer, warmup_epochs=3, base_lr=LEARNING_RATE,
+                                plateau_scheduler=plateau)
+    criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    WEIGHTS   = {'hand': 1.0, 'col': 1.2, 'layer': 1.0, 'cut': 1.5, 'double': 0.8}
+    print(f"{'Epoch':>6} | {'Loss':>8} | {'Hand':>7} | {'Col':>7} | "
+          f"{'Layer':>7} | {'Cut':>7} | {'Dbl':>7} | {'LR':>10}")
+    print("-" * 80)
+    best_loss = float('inf')
+    for epoch in range(EPOCHS_NOTE):
+        model.train()
+        acc = defaultdict(float)
+        for audio, history, stars, t_hand, t_col, t_layer, t_cut, t_double in dataloader:
+            audio, history, stars = audio.to(device), history.to(device), stars.to(device)
+            t_hand, t_col, t_layer, t_cut, t_double = (
+                t_hand.to(device), t_col.to(device), t_layer.to(device),
+                t_cut.to(device),  t_double.to(device)
+            )
+            optimizer.zero_grad()
+            out = model(audio, history, stars)
+            def ce(logits, target):
+                return criterion(logits.permute(0, 2, 1), target)
+            l_hand   = ce(out['hand'],   t_hand)
+            l_col    = ce(out['col'],    t_col)
+            l_layer  = ce(out['layer'],  t_layer)
+            l_cut    = ce(out['cut'],    t_cut)
+            l_double = ce(out['double'], t_double)
+            loss = (l_hand * WEIGHTS['hand'] + l_col * WEIGHTS['col']
+                  + l_layer * WEIGHTS['layer'] + l_cut * WEIGHTS['cut']
+                  + l_double * WEIGHTS['double'])
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            acc['total']  += loss.item()
+            acc['hand']   += l_hand.item()
+            acc['col']    += l_col.item()
+            acc['layer']  += l_layer.item()
+            acc['cut']    += l_cut.item()
+            acc['double'] += l_double.item()
+        n   = len(dataloader)
+        avg = {k: v / n for k, v in acc.items()}
+        scheduler.step(avg['total'])
+        print(f"{epoch+1:>6} | {avg['total']:>8.4f} | {avg['hand']:>7.4f} | "
+              f"{avg['col']:>7.4f} | {avg['layer']:>7.4f} | {avg['cut']:>7.4f} | "
+              f"{avg['double']:>7.4f} | {scheduler.get_lr():>10.6f}")
+        if avg['total'] < best_loss:
+            best_loss = avg['total']
+            torch.save(model.state_dict(), ckpt)
+    torch.save(model.state_dict(), os.path.join(MODELS_DIR, "note_net_final.pth"))
+    print(f"\n  NoteNet concluído. Melhor loss: {best_loss:.4f}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# Treino FlowNet  (novo)
+# ─────────────────────────────────────────────────────────────────
+
+def train_flow(device):
+    print("\n" + "="*60)
+    print("  FASE 3 — Treinando FlowNet")
+    print("="*60)
+
+    dataset    = FlowDataset(PROCESSED_DIR)
+    dataloader = _make_loader(dataset)
+
+    model = get_flow_model().to(device)
+    os.makedirs(MODELS_DIR, exist_ok=True)
+
+    ckpt = os.path.join(MODELS_DIR, "flow_net_best.pth")
+    if os.path.exists(ckpt):
+        model.load_state_dict(torch.load(ckpt, map_location=device))
+        print(f"  ✅ Retomando de {ckpt}\n")
+
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+    plateau   = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=4, factor=0.5)
+    scheduler = WarmupScheduler(optimizer, warmup_epochs=3, base_lr=LEARNING_RATE,
+                                plateau_scheduler=plateau)
+
+    criterion = nn.CrossEntropyLoss()
+
+    # Pesos das losses:
+    # hand_ok/cut_ok/col_ok são tarefas de detecção — peso maior para não ignorar
+    # new_* são tarefas de correção — peso menor, só importam quando _ok=1
+    W_OK  = 1.5   # peso dos heads de detecção
+    W_NEW = 0.8   # peso dos heads de correção
+
+    print(f"{'Epoch':>6} | {'Loss':>8} | {'HandOk':>7} | {'CutOk':>7} | "
+          f"{'ColOk':>7} | {'NewH':>6} | {'NewCut':>7} | {'NewCol':>7} | {'LR':>10}")
+    print("-" * 95)
 
     best_loss = float('inf')
-    os.makedirs("models", exist_ok=True)
 
-    for epoch in range(EPOCHS):
+    for epoch in range(EPOCHS_FLOW):
         model.train()
-        acc_loss = acc_beat = acc_comp = acc_vert = acc_div = 0.0
+        acc = defaultdict(float)
 
-        for batch in dataloader:
-            feats, t_beat, t_comp, t_vert, t_stars = [b.to(device) for b in batch]
+        for ctx, audio, stars, t_hand_ok, t_cut_ok, t_col_ok, t_new_hand, t_new_cut, t_new_col \
+                in dataloader:
+
+            ctx, audio, stars = ctx.to(device), audio.to(device), stars.to(device)
+            t_hand_ok, t_cut_ok, t_col_ok = (
+                t_hand_ok.to(device), t_cut_ok.to(device), t_col_ok.to(device)
+            )
+            t_new_hand, t_new_cut, t_new_col = (
+                t_new_hand.to(device), t_new_cut.to(device), t_new_col.to(device)
+            )
 
             optimizer.zero_grad()
+            out = model(ctx, audio, stars)
 
-            p_beat, p_comp, p_vert = model(feats, t_stars)
+            # Losses de detecção (precisa corrigir ou não?)
+            l_hand_ok = criterion(out['hand_ok'], t_hand_ok)
+            l_cut_ok  = criterion(out['cut_ok'],  t_cut_ok)
+            l_col_ok  = criterion(out['col_ok'],  t_col_ok)
 
-            # Reshape para CrossEntropy: (Batch, Classes, Seq)
-            p_comp_ce = p_comp.permute(0, 2, 1)
-            p_vert_ce = p_vert.permute(0, 2, 1)
+            # Losses de correção (qual o valor correto?)
+            l_new_hand = criterion(out['new_hand'], t_new_hand)
+            l_new_cut  = criterion(out['new_cut'],  t_new_cut)
+            l_new_col  = criterion(out['new_col'],  t_new_col)
 
-            # Perdas supervisionadas
-            loss_b = crit_beat(p_beat, t_beat)
-            loss_c = crit_class(p_comp_ce, t_comp)
-            loss_v = crit_class(p_vert_ce, t_vert)
-
-            # Loss de diversidade (regularização de padrão)
-            loss_d = diversity_loss(p_comp_ce, p_vert_ce)
-
-            # Soma ponderada — beat é o sinal mais importante
-            loss = (loss_b * 1.5
-                    + loss_c * 0.75
-                    + loss_v * 0.75
-                    + loss_d * DIVERSITY_LOSS_WEIGHT)
+            loss = (
+                (l_hand_ok + l_cut_ok + l_col_ok) * W_OK
+              + (l_new_hand + l_new_cut + l_new_col) * W_NEW
+            )
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            acc_loss += loss.item()
-            acc_beat += loss_b.item()
-            acc_comp += loss_c.item()
-            acc_vert += loss_v.item()
-            acc_div  += loss_d.item()
+            acc['total']    += loss.item()
+            acc['hand_ok']  += l_hand_ok.item()
+            acc['cut_ok']   += l_cut_ok.item()
+            acc['col_ok']   += l_col_ok.item()
+            acc['new_hand'] += l_new_hand.item()
+            acc['new_cut']  += l_new_cut.item()
+            acc['new_col']  += l_new_col.item()
 
-        n = len(dataloader)
-        avg_loss = acc_loss / n
-        avg_beat = acc_beat / n
-        avg_comp = acc_comp / n
-        avg_vert = acc_vert / n
-        avg_div  = acc_div  / n
+        n   = len(dataloader)
+        avg = {k: v / n for k, v in acc.items()}
+        scheduler.step(avg['total'])
 
-        scheduler.step(avg_loss)
-        current_lr = scheduler.get_lr()
+        print(f"{epoch+1:>6} | {avg['total']:>8.4f} | {avg['hand_ok']:>7.4f} | "
+              f"{avg['cut_ok']:>7.4f} | {avg['col_ok']:>7.4f} | {avg['new_hand']:>6.4f} | "
+              f"{avg['new_cut']:>7.4f} | {avg['new_col']:>7.4f} | {scheduler.get_lr():>10.6f}")
 
-        print(f"{epoch+1:>6} | {avg_loss:>8.4f} | {avg_beat:>8.4f} | "
-              f"{avg_comp:>8.4f} | {avg_vert:>8.4f} | {avg_div:>8.4f} | {current_lr:>10.6f}")
+        if avg['total'] < best_loss:
+            best_loss = avg['total']
+            torch.save(model.state_dict(), ckpt)
 
-        # Salva o melhor modelo automaticamente
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            torch.save(model.state_dict(), "models/director_net_v2_stars_best.pth")
+    torch.save(model.state_dict(), os.path.join(MODELS_DIR, "flow_net_final.pth"))
+    print(f"\n  FlowNet concluído. Melhor loss: {best_loss:.4f}")
 
-    # Salva o modelo final da última época também
-    torch.save(model.state_dict(), "models/director_net_v2_stars.pth")
-    print(f"\nTreino concluído! Melhor loss: {best_loss:.4f}")
-    print("Modelos salvos:")
-    print("  models/director_net_v2_stars.pth       (última época)")
-    print("  models/director_net_v2_stars_best.pth  (melhor época)")
+
+# ─────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────
+
+def train():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--phase",
+                        choices=["timing", "notes", "flow", "all"],
+                        default="all",
+                        help="Fase a treinar. 'all' treina as três em sequência.")
+    args   = parser.parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Dispositivo: {device}\n")
+
+    if args.phase in ("timing", "all"):
+        train_timing(device)
+    if args.phase in ("notes", "all"):
+        train_notes(device)
+    if args.phase in ("flow", "all"):
+        train_flow(device)
+
+    print("\n✅ Treino completo.")
+    print("   models/timing_net_best.pth  — TimingNet")
+    print("   models/note_net_best.pth    — NoteNet")
+    print("   models/flow_net_best.pth    — FlowNet")
 
 
 if __name__ == "__main__":

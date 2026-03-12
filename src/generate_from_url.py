@@ -3,271 +3,405 @@ import json
 import shutil
 import torch
 import numpy as np
+from collections import deque
 from youtube_downloader import download_from_youtube
-from models_optimized import get_model
-from pattern_manager import PatternManager
+from models_optimized import get_timing_model, get_note_model, get_flow_model, NOTE_HISTORY, FLOW_CONTEXT
 from flow_fixer import FlowFixer
 from audio_processor import extract_features, detect_bpm, add_silence, analyze_energy
 
 DIFFICULTY_MAP = {1: "Easy", 2: "Normal", 3: "Hard", 4: "Expert", 5: "ExpertPlus"}
 DIFFICULTY_PARAMS = {
-    "Easy":       {"njs": 10, "offset": 0.0},
-    "Normal":     {"njs": 12, "offset": 0.0},
+    "Easy":       {"njs": 10, "offset":  0.0},
+    "Normal":     {"njs": 12, "offset":  0.0},
     "Hard":       {"njs": 14, "offset": -0.2},
     "Expert":     {"njs": 16, "offset": -0.4},
-    "ExpertPlus": {"njs": 18, "offset": -0.7}
+    "ExpertPlus": {"njs": 18, "offset": -0.7},
 }
 
-def zip_folder(folder_path, output_path):
-    if os.path.exists(output_path + ".zip"): os.remove(output_path + ".zip")
-    shutil.make_archive(output_path, 'zip', folder_path)
-    print(f"Pacote final criado: {output_path}.zip")
+_PADDING_NOTE = np.array([0, 1, 0, 8], dtype=np.float32)
 
-def generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, difficulty_name, target_stars):
-    print(f"   -> Gerando: {difficulty_name} ({target_stars:.2f} estrelas)...")
-    
-    device = next(model.parameters()).device
-    inputs = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
-    stars_tensor = torch.tensor([[target_stars]], dtype=torch.float32).to(device)
-    
+
+def _build_note_dict(beat_time, hand, col, layer, cut):
+    return {
+        '_time':         float(beat_time),
+        '_lineIndex':    int(col),
+        '_lineLayer':    int(layer),
+        '_type':         int(hand),
+        '_cutDirection': int(cut),
+    }
+
+
+def _encode_history(history_deque):
+    arr = np.zeros(NOTE_HISTORY * 4, dtype=np.float32)
+    for i, note_vec in enumerate(history_deque):
+        arr[i*4:(i+1)*4] = note_vec
+    return arr
+
+
+def _apply_flow_net(flow_model, notes, features, target_stars, device,
+                    num_frames, frame_dur, bpm):
+    """
+    Passa o mapa gerado pelo NoteNet pelo FlowNet para refinamento.
+
+    Para cada nota, monta uma janela de contexto de FLOW_CONTEXT*2+1 notas,
+    consulta o FlowNet e aplica as correções sugeridas.
+
+    Só aplica correção quando o modelo tem alta confiança (threshold > 0.75)
+    para não sobre-corrigir notas que já estão certas.
+    """
+    if not notes or flow_model is None:
+        return notes
+
+    CORRECTION_THRESHOLD = 0.75  # confiança mínima para aplicar correção
+    window_size = FLOW_CONTEXT * 2 + 1
+    N = len(notes)
+
+    corrected = [dict(n) for n in notes]  # copia para não mudar originais
+    seconds_per_beat = 60.0 / bpm
+
+    corrections = {'hand': 0, 'cut': 0, 'col': 0}
+
+    flow_model.eval()
     with torch.no_grad():
-        p_beat, p_comp, p_vert = model(inputs, stars_tensor)
-        beat_probs = torch.sigmoid(p_beat).squeeze().cpu().numpy()
-        comp_classes = torch.argmax(p_comp, dim=2).squeeze().cpu().numpy()
-        vert_classes = torch.argmax(p_vert, dim=2).squeeze().cpu().numpy()
+        for i in range(N):
+            # ── Monta janela de contexto ──────────────────────────
+            window_flat = np.zeros(window_size * 4, dtype=np.float32)
+            for w in range(window_size):
+                note_idx = i - FLOW_CONTEXT + w
+                if 0 <= note_idx < N:
+                    n = corrected[note_idx]
+                    window_flat[w*4]   = float(n['_type'])
+                    window_flat[w*4+1] = float(n['_lineIndex'])
+                    window_flat[w*4+2] = float(n['_lineLayer'])
+                    window_flat[w*4+3] = float(n['_cutDirection'])
+                else:
+                    window_flat[w*4:(w+1)*4] = _PADDING_NOTE
 
-    # --- Lógica de Densidade de Notas (Target Density) ---
-    # A densidade é guiada principalmente pela confiança média da IA,
-    # com as estrelas atuando como ajuste suave (não uma regra bruta).
-    ai_conf = float(np.mean(beat_probs))
-    base_nps = 1.2 + ai_conf * 6.5
+            # ── Áudio local ────────────────────────────────────────
+            beat_time = corrected[i]['_time']
+            time_sec  = beat_time * seconds_per_beat
+            frame_idx = min(int(time_sec / frame_dur), num_frames - 1)
+            audio_local = features[frame_idx]
+
+            # ── Inferência ─────────────────────────────────────────
+            ctx_t   = torch.tensor(window_flat,  dtype=torch.float32).unsqueeze(0).to(device)
+            audio_t = torch.tensor(audio_local,  dtype=torch.float32).unsqueeze(0).to(device)
+            stars_t = torch.tensor([[target_stars]], dtype=torch.float32).to(device)
+
+            out = flow_model(ctx_t, audio_t, stars_t)
+
+            def confidence(logits):
+                probs = torch.softmax(logits.squeeze(), dim=-1)
+                return probs[1].item()  # prob de "precisa corrigir"
+
+            def argmax(logits):
+                return torch.argmax(logits.squeeze(), dim=-1).item()
+
+            # ── Aplica correções com threshold de confiança ────────
+            if confidence(out['hand_ok']) > CORRECTION_THRESHOLD:
+                corrected[i]['_type'] = argmax(out['new_hand'])
+                corrections['hand'] += 1
+
+            if confidence(out['cut_ok']) > CORRECTION_THRESHOLD:
+                corrected[i]['_cutDirection'] = argmax(out['new_cut'])
+                corrections['cut'] += 1
+
+            if confidence(out['col_ok']) > CORRECTION_THRESHOLD:
+                corrected[i]['_lineIndex'] = argmax(out['new_col'])
+                corrections['col'] += 1
+
+    total_corrections = sum(corrections.values())
+    if total_corrections > 0:
+        print(f"      FlowNet: {total_corrections} correções "
+              f"(mão={corrections['hand']} cut={corrections['cut']} col={corrections['col']})")
+
+    return corrected
+
+
+def generate_difficulty(timing_model, note_model, flow_model,
+                        features, energy_profile,
+                        bpm, sr, hop_length, difficulty_name, target_stars):
+    print(f"   -> Gerando: {difficulty_name} ({target_stars:.2f}★)...")
+
+    device     = next(timing_model.parameters()).device
+    frame_dur  = hop_length / sr
+    num_frames = len(features)
+
+    # ── FASE 1: TimingNet ─────────────────────────────────────────
+    inputs  = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
+    stars_t = torch.tensor([[target_stars]], dtype=torch.float32).to(device)
+
+    with torch.no_grad():
+        beat_probs = torch.sigmoid(
+            timing_model(inputs, stars_t)
+        ).squeeze().cpu().numpy()
+
+    ai_conf    = float(np.mean(beat_probs))
+    base_nps   = 1.2 + ai_conf * 6.5
     star_boost = 1.0 + np.clip((target_stars - 5.0) * 0.08, -0.2, 0.4)
     target_nps = base_nps * star_boost
+    duration   = num_frames * frame_dur
+    target_n   = int(max(80, duration * target_nps))
 
-    duration_seconds = len(beat_probs) * (hop_length / sr)
-    target_total_notes = int(max(80, duration_seconds * target_nps))
+    print(f"      TimingNet: {target_nps:.2f} NPS → ~{target_n} notas alvo")
 
-    print(f"      Meta de Densidade AI-driven: {target_nps:.2f} NPS (~{target_total_notes} notas)")
+    min_frac  = 8.0 if target_stars > 7 else 4.0
+    cooldown  = int((60.0 / bpm / min_frac) / frame_dur)
+    MIN_START = 2.0
 
-    frame_dur = hop_length / sr
-    # Cooldown mínimo absoluto (físico) para evitar sobreposição impossível
-    # 60/BPM = seg/beat. /4 = 1/4 de beat.
-    # Em mapas rápidos, permitimos até 1/8.
-    min_beat_fraction = 8.0 if target_stars > 7 else 4.0
-    min_cooldown_frames = int((60.0 / bpm / min_beat_fraction) / frame_dur)
-    
-    # 1. Encontrar TODOS os picos locais (candidatos a nota)
-    # Não usamos threshold aqui. Se for um pico, é um candidato.
     candidates = []
-    MIN_START_TIME = 2.0
-    
-    for i in range(1, len(beat_probs) - 1):
-        time_sec = i * frame_dur
-        if time_sec < MIN_START_TIME: continue
-        
-        prob = beat_probs[i]
-        
-        # É um pico local?
-        if prob > beat_probs[i-1] and prob > beat_probs[i+1]:
-            # Adiciona à lista de candidatos: (probabilidade, índice_frame)
-            # Multiplicamos a probabilidade pela energia local para dar preferência a partes intensas
-            score = prob * (0.8 + 0.4 * energy_profile[i])
-            candidates.append((score, i))
-            
-    # 2. Ordenar candidatos pela confiança da IA (do maior para o menor)
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    
-    # 3. Selecionar os melhores picos respeitando o cooldown e a meta de notas
-    selected_indices = []
-    occupied_frames = set()
-    
-    # Margem de segurança para o cooldown (evitar notas coladas demais)
-    cooldown_margin = min_cooldown_frames
-    
-    for score, idx in candidates:
-        if len(selected_indices) >= target_total_notes:
-            break
-            
-        # Verifica conflito de cooldown com notas já selecionadas
-        # (Uma implementação simples de verificação de proximidade)
-        is_too_close = False
-        
-        # Otimização: verificar apenas numa janela próxima seria mais rápido, 
-        # mas para <5000 notas isso é ok.
-        for selected_idx in selected_indices:
-            if abs(selected_idx - idx) < cooldown_margin:
-                is_too_close = True
-                break
-        
-        if not is_too_close:
-            selected_indices.append(idx)
-            
-    # Recupera a ordem temporal
-    selected_indices.sort()
-    
-    # 4. Gerar as notas finais usando o PatternManager
-    pattern_manager = PatternManager(difficulty=difficulty_name)
-    raw_notes = []
-    last_frame = -999
-    
-    for idx in selected_indices:
-        current_beat = (idx * frame_dur) / (60.0 / bpm)
-        # Quantização para 1/16 de beat
-        beat_time = round(current_beat * 16) / 16.0
-        
-        # Evita duplicatas exatas de tempo (caso o arredondamento gere colisão)
-        if raw_notes and beat_time <= raw_notes[-1]['_time']:
+    for i in range(1, num_frames - 1):
+        if i * frame_dur < MIN_START:
             continue
-            
-        time_gap = (idx - last_frame) * frame_dur
-        
-        # O PatternManager constrói a nota baseada na "intenção" (classes) da IA naquele momento
-        new_notes = pattern_manager.apply_pattern(
-            time=beat_time,
-            bpm=bpm,
-            complexity_idx=comp_classes[idx],
-            vertical_idx=vert_classes[idx],
-            time_gap=time_gap,
-            intensity=float(beat_probs[idx]),
-            star_level=target_stars,
-        )
-        
-        if new_notes:
-            raw_notes.extend(new_notes)
-            last_frame = idx
-            
-            # Se gerou um burst/stream, avança o "last_frame" virtualmente
-            # para evitar sobrepor o stream com a próxima nota selecionada
-            if len(new_notes) > 1:
-                # Estimativa grosseira: cada nota extra consome um pouco de tempo
-                extra_frames = int((len(new_notes) * 0.15) / frame_dur) 
-                # Removemos futuros candidatos que colidiriam com este burst
-                # (Isso é implícito pois já filtramos por cooldown simples antes, 
-                # mas o burst ocupa mais espaço que uma nota simples)
-                pass
+        if beat_probs[i] > beat_probs[i-1] and beat_probs[i] > beat_probs[i+1]:
+            score = beat_probs[i] * (0.8 + 0.4 * energy_profile[i])
+            candidates.append((score, i))
 
-    print(f"      Notas geradas (bruto): {len(raw_notes)}")
-    
-    # FlowFixer
-    all_objects = FlowFixer.fix(raw_notes, bpm)
-    final_notes = [obj for obj in all_objects if obj['_type'] != 3]
-    final_bombs = [obj for obj in all_objects if obj['_type'] == 3]
-    
-    final_notes.sort(key=lambda x: x['_time'])
-    unique_bombs = [dict(t) for t in {tuple(d.items()) for d in final_bombs}]
-    unique_bombs.sort(key=lambda x: x['_time'])
-            
-    return final_notes, unique_bombs
+    candidates.sort(reverse=True)
+    selected = []
+    for score, idx in candidates:
+        if len(selected) >= target_n:
+            break
+        if all(abs(idx - s) >= cooldown for s in selected):
+            selected.append(idx)
+    selected.sort()
+    print(f"      Frames selecionados: {len(selected)}")
+
+    # ── FASE 2: NoteNet ───────────────────────────────────────────
+    note_model.eval()
+    history   = deque([_PADDING_NOTE.copy() for _ in range(NOTE_HISTORY)], maxlen=NOTE_HISTORY)
+    raw_notes = []
+    last_beat = -999.0
+
+    with torch.no_grad():
+        for idx in selected:
+            audio_local = torch.tensor(
+                features[idx], dtype=torch.float32
+            ).unsqueeze(0).unsqueeze(0).to(device)
+
+            history_vec = torch.tensor(
+                _encode_history(history), dtype=torch.float32
+            ).unsqueeze(0).unsqueeze(0).to(device)
+
+            out = note_model(audio_local, history_vec, stars_t)
+
+            def sample(logits, temperature=0.8):
+                logits = logits.squeeze() / temperature
+                probs  = torch.softmax(logits, dim=-1)
+                return torch.multinomial(probs, 1).item()
+
+            hand   = sample(out['hand'])
+            col    = sample(out['col'])
+            layer  = sample(out['layer'])
+            cut    = sample(out['cut'])
+            double = sample(out['double'], temperature=1.0)
+
+            current_beat = (idx * frame_dur) / (60.0 / bpm)
+            beat_time    = round(current_beat * 16) / 16.0
+
+            if beat_time <= last_beat:
+                continue
+
+            note = _build_note_dict(beat_time, hand, col, layer, cut)
+            raw_notes.append(note)
+            history.append(np.array([hand, col, layer, cut], dtype=np.float32))
+            last_beat = beat_time
+
+            if double == 1:
+                double_beat  = round((beat_time + 1/16) * 16) / 16.0
+                double_hand  = 1 - hand
+                double_col   = sample(out['double_col'])
+                double_layer = sample(out['double_layer'])
+                double_cut   = sample(out['double_cut'])
+                note2 = _build_note_dict(double_beat, double_hand,
+                                          double_col, double_layer, double_cut)
+                raw_notes.append(note2)
+                history.append(np.array([double_hand, double_col,
+                                          double_layer, double_cut], dtype=np.float32))
+                last_beat = double_beat
+
+    print(f"      Notas brutas (NoteNet): {len(raw_notes)}")
+
+    # ── FASE 3: FlowNet refina o mapa ─────────────────────────────
+    refined_notes = _apply_flow_net(
+        flow_model, raw_notes, features, target_stars,
+        device, num_frames, frame_dur, bpm
+    )
+
+    # ── FASE 4: FlowFixer valida fisicamente ──────────────────────
+    all_obj = FlowFixer.fix(refined_notes, bpm)
+    notes   = [o for o in all_obj if o['_type'] != FlowFixer.BOMB]
+    bombs   = [o for o in all_obj if o['_type'] == FlowFixer.BOMB]
+
+    notes.sort(key=lambda x: x['_time'])
+    bombs = [dict(t) for t in {tuple(d.items()) for d in bombs}]
+    bombs.sort(key=lambda x: x['_time'])
+
+    print(f"      Notas finais: {len(notes)}")
+    return notes, bombs
+
 
 def create_info_dat(song_name, bpm, audio_filename, cover_filename, difficulties_data):
     beatmap_sets = []
-    for diff_name, data in difficulties_data.items():
-        params = DIFFICULTY_PARAMS[diff_name]
+    for diff_name in difficulties_data:
+        p = DIFFICULTY_PARAMS[diff_name]
         beatmap_sets.append({
-            "_difficulty": diff_name,
-            "_beatmapFilename": f"{diff_name}.dat",
-            "_noteJumpMovementSpeed": params["njs"],
-            "_noteJumpStartBeatOffset": params["offset"],
-        }) # parametros perfeitos para o Info.dat funcionarem corretamente
-        
-    info = {
-        "_version": "2.1.0", # Obrigatoriamente 2.0 ou 2.1 ou seja v2 notes
-        "_songName": song_name,
-        "_songSubName": "AI Generated",
-        "_songAuthorName": "Artist",
-        "_levelAuthorName": "BSIAMapperV2",
-        "_beatsPerMinute": float(bpm),
-        "_songFilename": audio_filename,
-        "_coverImageFilename": cover_filename,
-        "_environmentName": "DefaultEnvironment",
-        "_songTimeOffset": 0,
-        "_difficultyBeatmapSets": [{"_beatmapCharacteristicName": "Standard", "_difficultyBeatmaps": beatmap_sets}]
+            "_difficulty":              diff_name,
+            "_beatmapFilename":         f"{diff_name}.dat",
+            "_noteJumpMovementSpeed":   p["njs"],
+            "_noteJumpStartBeatOffset": p["offset"],
+        })
+    return {
+        "_version":              "2.1.0",
+        "_songName":             song_name,
+        "_songSubName":          "AI Generated",
+        "_songAuthorName":       "Artist",
+        "_levelAuthorName":      "BSIAMapperV3",
+        "_beatsPerMinute":       float(bpm),
+        "_songFilename":         audio_filename,
+        "_coverImageFilename":   cover_filename,
+        "_environmentName":      "DefaultEnvironment",
+        "_songTimeOffset":       0,
+        "_difficultyBeatmapSets": [{
+            "_beatmapCharacteristicName": "Standard",
+            "_difficultyBeatmaps": beatmap_sets,
+        }],
     }
-    return info
+
 
 def save_difficulty_dat(notes, bombs, folder, filename):
-    all_objects = sorted(notes + bombs, key=lambda x: x['_time'])
-    data = {"_version": "2.2.0", "_notes": all_objects, "_obstacles": [], "_events": []}
-    with open(os.path.join(folder, filename), 'w') as f: json.dump(data, f)
+    data = {
+        "_version":   "2.2.0",
+        "_notes":     sorted(notes + bombs, key=lambda x: x['_time']),
+        "_obstacles": [],
+        "_events":    [],
+    }
+    with open(os.path.join(folder, filename), 'w') as f:
+        json.dump(data, f)
+
 
 def main():
-    print("="*50 + "\n   BEAT SABER AI MAPPER V2 - GERAÇÃO POR URL\n" + "="*50)
-    
-    url = input("Digite a URL da música (YouTube): ").strip()
-    if not url: print("URL inválida."); return
+    print("=" * 60)
+    print("   BEAT SABER AI MAPPER V3 — TimingNet + NoteNet + FlowNet")
+    print("=" * 60)
 
-    print("\n[1/5] Baixando e processando áudio...")
+    url = input("\nURL da música (YouTube): ").strip()
+    if not url:
+        print("URL inválida.")
+        return
+
+    print("\n[1/5] Baixando áudio...")
     mp3_path, cover_path = download_from_youtube(url, output_folder="data/temp_download")
-    if not mp3_path: print("Falha no download."); return
+    if not mp3_path:
+        print("Falha no download.")
+        return
+
     song_name = os.path.splitext(os.path.basename(mp3_path))[0]
-    
-    print("\n[2/5] Configuração de Dificuldades")
-    print("Quais dificuldades deseja gerar? (1=Easy, 2=Normal, 3=Hard, 4=Expert, 5=ExpertPlus)")
-    choices = input("Exemplo: 3,4,5 -> ").strip()
-    
+
+    print("\n[2/5] Configuração de dificuldades")
+    print("Dificuldades (1=Easy 2=Normal 3=Hard 4=Expert 5=ExpertPlus)")
+    choices = input("Exemplo: 3,4,5 → ").strip()
+
     selected_diffs = []
     try:
         for p in choices.split(','):
-            val = int(p.strip())
-            if val in DIFFICULTY_MAP: selected_diffs.append(DIFFICULTY_MAP[val])
-    except: selected_diffs = []
-    if not selected_diffs: print("Seleção inválida. Usando Expert (4) por padrão."); selected_diffs = ["Expert"]
-    
+            v = int(p.strip())
+            if v in DIFFICULTY_MAP:
+                selected_diffs.append(DIFFICULTY_MAP[v])
+    except Exception:
+        pass
+    if not selected_diffs:
+        print("Seleção inválida. Usando Expert.")
+        selected_diffs = ["Expert"]
+
     order = list(DIFFICULTY_MAP.values())
     selected_diffs.sort(key=lambda x: order.index(x))
-    
-    difficulties_with_stars = {}
-    print("\n[3/5] Defina o nível de estrelas para cada dificuldade:")
-    for diff_name in selected_diffs:
+
+    difficulties = {}
+    print("\n[3/5] Estrelas por dificuldade:")
+    for diff in selected_diffs:
         while True:
             try:
-                stars_input = float(input(f"  - {diff_name}: ").strip())
-                if stars_input > 0:
-                    difficulties_with_stars[diff_name] = {"stars": stars_input}
+                s = float(input(f"  {diff}: ").strip())
+                if s > 0:
+                    difficulties[diff] = s
                     break
-                else: print("  Por favor, insira um número positivo.")
-            except ValueError: print("  Entrada inválida. Use um número (ex: 8.87).")
+            except ValueError:
+                pass
 
     output_folder = os.path.join("output", song_name.replace(" ", "_"))
-    if os.path.exists(output_folder): shutil.rmtree(output_folder)
+    if os.path.exists(output_folder):
+        shutil.rmtree(output_folder)
     os.makedirs(output_folder)
-    
-    final_audio_name, final_cover_name = "song.egg", "cover.png"
-    
-    print("\n[4/5] Analisando áudio e extraindo features...")
-    raw_bpm = detect_bpm(mp3_path)
-    bpm = round(raw_bpm)
-    print(f"BPM Detectado: {raw_bpm:.2f} -> Usando: {bpm}")
-    
-    full_audio_path = os.path.join(output_folder, final_audio_name)
-    add_silence(mp3_path, full_audio_path)
-    if cover_path and os.path.exists(cover_path): shutil.copy(cover_path, os.path.join(output_folder, final_cover_name))
-    
-    features, sr, hop_length = extract_features(full_audio_path, bpm)
-    energy_profile = analyze_energy(full_audio_path, hop_length=hop_length, sr=sr)
-    if len(energy_profile) != len(features): energy_profile = np.pad(energy_profile, (0, len(features) - len(energy_profile)))
+
+    print("\n[4/5] Analisando áudio...")
+    bpm = round(detect_bpm(mp3_path))
+    print(f"BPM detectado: {bpm}")
+
+    audio_out = os.path.join(output_folder, "song.egg")
+    add_silence(mp3_path, audio_out)
+    if cover_path and os.path.exists(cover_path):
+        shutil.copy(cover_path, os.path.join(output_folder, "cover.png"))
+
+    features, sr, hop_length = extract_features(audio_out, bpm)
+    energy = analyze_energy(audio_out, hop_length=hop_length, sr=sr)
+    if len(energy) < len(features):
+        energy = np.pad(energy, (0, len(features) - len(energy)))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = get_model().to(device)
-    model_path = "models/director_net_v2_stars.pth"
-    if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        model.eval()
-    else: print(f"ERRO: Modelo '{model_path}' não encontrado. Treine o modelo primeiro."); return
+    print(f"Dispositivo: {device}")
+
+    timing_model = get_timing_model().to(device)
+    note_model   = get_note_model().to(device)
+    flow_model   = get_flow_model().to(device)
+
+    def load_model(model, path, required=True):
+        if os.path.exists(path):
+            model.load_state_dict(torch.load(path, map_location=device))
+            model.eval()
+            print(f"  ✅ Carregado: {path}")
+            return True
+        else:
+            if required:
+                print(f"  ❌ Não encontrado: {path} — treine primeiro.")
+            else:
+                print(f"  ⚠️  FlowNet não encontrado ({path}) — gerando sem refinamento.")
+            return False
+
+    ok  = load_model(timing_model, "models/timing_net_best.pth")
+    ok &= load_model(note_model,   "models/note_net_best.pth")
+    # FlowNet é opcional — se não existir, gera sem refinamento
+    flow_ok = load_model(flow_model, "models/flow_net_best.pth", required=False)
+    if not flow_ok:
+        flow_model = None
+
+    if not ok:
+        return
 
     print("\n[5/5] Gerando mapas...")
-    for diff_name, data in difficulties_with_stars.items():
-        notes, bombs = generate_difficulty(model, features, energy_profile, bpm, sr, hop_length, diff_name, data['stars'])
+    for diff_name, stars in difficulties.items():
+        notes, bombs = generate_difficulty(
+            timing_model, note_model, flow_model,
+            features, energy, bpm, sr, hop_length, diff_name, stars
+        )
         save_difficulty_dat(notes, bombs, output_folder, f"{diff_name}.dat")
-        
-    info_content = create_info_dat(song_name, bpm, final_audio_name, final_cover_name, difficulties_with_stars)
-    with open(os.path.join(output_folder, "Info.dat"), 'w') as f: json.dump(info_content, f, indent=2)
-        
-    zip_folder(output_folder, os.path.join("output", song_name.replace(" ", "_")))
-    try: shutil.rmtree("data/temp_download")
-    except: pass
-        
-    print("\nSUCESSO! Mapa gerado em 'output/'")
+
+    info = create_info_dat(song_name, bpm, "song.egg", "cover.png", difficulties)
+    with open(os.path.join(output_folder, "Info.dat"), 'w') as f:
+        json.dump(info, f, indent=2)
+
+    zip_out = os.path.join("output", song_name.replace(" ", "_"))
+    if os.path.exists(zip_out + ".zip"):
+        os.remove(zip_out + ".zip")
+    shutil.make_archive(zip_out, 'zip', output_folder)
+
+    try:
+        shutil.rmtree("data/temp_download")
+    except Exception:
+        pass
+
+    print(f"\n✅ Mapa gerado: output/{song_name.replace(' ', '_')}.zip")
+
 
 if __name__ == "__main__":
     main()
