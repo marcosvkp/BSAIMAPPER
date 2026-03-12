@@ -8,7 +8,7 @@ class DirectorNet(nn.Module):
     V2.1 — input_size atualizado para 93 features (era 82).
     Veja audio_processor.py para o detalhamento completo das 93 features.
     """
-    def __init__(self, input_size=93, hidden_size=128, star_embedding_size=16):
+    def __init__(self, input_size=93, hidden_size=256, star_embedding_size=16):
         super(DirectorNet, self).__init__()
 
         # --- Camada de Embedding para as Estrelas ---

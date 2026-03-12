@@ -11,8 +11,8 @@ from models_optimized import get_model
 # ─────────────────────────────────────────────────────────────────
 # Parâmetros de Treinamento
 # ─────────────────────────────────────────────────────────────────
-BATCH_SIZE    = 64
-SEQ_LEN       = 300   # +50 frames de contexto vs versão anterior
+BATCH_SIZE    = 256
+SEQ_LEN       = 512   # +50 frames de contexto vs versão anterior
 EPOCHS        = 60    # +20 épocas: loss ainda estava caindo no epoch 40
 LEARNING_RATE = 0.0007
 NUM_WORKERS   = os.cpu_count() or 4
