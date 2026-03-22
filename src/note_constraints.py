@@ -30,9 +30,10 @@ Configuração de colunas:
     P(col=1) = 30%  (centro-esquerda — crossover leve)
     P(col=0) = 10%  (extrema esquerda — crossover forte)
 
-Estes pesos são aplicados como REDISTRIBUIÇÃO: se o PlaceNet já colocou a nota
-numa coluna válida para a mão, mantemos. Se colocou num lugar impossível
-(ex: hand=0 em col=3 sem probabilidade de crossover), redistribuímos.
+Estes pesos são aplicados SEMPRE — o PlaceNet não tem consciência de "lado de cada mão",
+então ignoramos a coluna que ele escolheu e sorteamos do zero para cada nota.
+Resultado: mão esquerda fica predominantemente nas cols 0-1, direita nas cols 2-3,
+com crossovers ocasionais que dão variedade sem quebrar a leitura.
 """
 
 from __future__ import annotations
@@ -122,29 +123,16 @@ def apply_constraints(notes: List[Dict]) -> List[Dict]:
 
     BEAT_THRESH = 0.0625  # notas dentro de 1/16 beat são "simultâneas"
 
-    # ── Passo 1: redistribui colunas por mão ─────────────────────
+    # ── Passo 1: sorteia coluna para cada nota (sempre, ignora PlaceNet) ───
+    # O PlaceNet não tem noção de "lado de cada mão" — apenas aprendeu
+    # padrões de posição do dataset. Aqui forçamos a distribuição correta:
+    # cada nota sorteia sua coluna a partir dos pesos configurados acima.
     for note in notes:
         hand = note['_type']
         if hand not in (0, 1):
             continue
-
-        col = note['_lineIndex']
-        weights = LEFT_COL_WEIGHTS if hand == 0 else RIGHT_COL_WEIGHTS
-        valid_cols = {c for c, _ in weights}
-
-        # Coluna está completamente fora do espaço configurado?
-        # (não deveria acontecer com grade 0-3, mas protege contra dados corrompidos)
-        if col not in valid_cols:
-            note['_lineIndex'] = _assign_col(hand)
-            col_fixes += 1
-            continue
-
-        # Verifica se a coluna atual é "possível" para esta mão com base nos pesos.
-        # Se o peso for zero (coluna não listada), redistribui.
-        weight_map = dict(weights)
-        if weight_map.get(col, 0) == 0:
-            note['_lineIndex'] = _assign_col(hand)
-            col_fixes += 1
+        note['_lineIndex'] = _assign_col(hand)
+        col_fixes += 1
 
     # ── Passo 2: resolve conflitos de posição ─────────────────────
     # Agrupa notas simultâneas e garante que duas mãos diferentes
