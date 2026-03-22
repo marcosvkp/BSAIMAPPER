@@ -1,118 +1,93 @@
+"""
+youtube_downloader.py — Download de áudio do YouTube
+
+Baixa o áudio de um vídeo do YouTube, converte para MP3 (análise)
+e OGG/egg (Beat Saber), e salva a thumbnail como cover.png.
+
+Usa imageio-ffmpeg para localizar o ffmpeg automaticamente
+(funciona em Windows, Linux e macOS sem configuração manual).
+"""
+
 import os
 import requests
-from pytubefix import YouTube
 import imageio_ffmpeg
-from pydub import AudioSegment
+import subprocess
+from pytubefix import YouTube
 from PIL import Image
 from io import BytesIO
 
-AudioSegment.converter = r"C:\ffmpeg\bin\ffmpeg.exe"
-AudioSegment.ffprobe = r"C:\ffmpeg\bin\ffprobe.exe"
 
-def download_from_youtube(url, output_folder="data/input_music"):
+def download_from_youtube(url: str, output_folder: str = "data/input_music"):
     """
-    Baixa o áudio de um vídeo do YouTube usando pytubefix,
-    converte para MP3 e também cria uma versão OGG (.egg) usando pydub.
-    Também baixa a thumbnail e salva como cover.png.
-    
-    Retorna uma tupla: (caminho_mp3, caminho_cover)
-    """
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
+    Baixa áudio + thumbnail de um vídeo do YouTube.
 
-    # Configurar pydub para usar o ffmpeg do imageio-ffmpeg
-    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-    AudioSegment.converter = ffmpeg_path
-    
+    Retorna:
+        (mp3_path, cover_path) — caminhos dos arquivos salvos,
+        ou (None, None) em caso de erro.
+    """
+    os.makedirs(output_folder, exist_ok=True)
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+
     try:
-        print(f"Acessando vídeo: {url}")
+        print(f"  Acessando: {url}")
         yt = YouTube(url)
-        print(f"Título: {yt.title}")
-        
-        # --- Download Thumbnail ---
+        print(f"  Título: {yt.title}")
+
+        # ── Thumbnail ─────────────────────────────────────────────
         cover_path = os.path.join(output_folder, "cover.png")
         try:
-            print(f"Baixando thumbnail: {yt.thumbnail_url}")
-            response = requests.get(yt.thumbnail_url)
-            img = Image.open(BytesIO(response.content))
-            # Resize to 256x256 as per Beat Saber standard (optional but good)
-            img = img.resize((256, 256))
+            resp = requests.get(yt.thumbnail_url, timeout=10)
+            img  = Image.open(BytesIO(resp.content)).resize((256, 256))
             img.save(cover_path)
-            print(f"Cover salvo: {cover_path}")
         except Exception as e:
-            print(f"Erro ao baixar thumbnail: {e}")
+            print(f"  ⚠  Thumbnail indisponível: {e}")
             cover_path = None
 
-        # --- Download Audio ---
-        # Baixar apenas o stream de áudio (geralmente mp4/m4a ou webm)
-        stream = yt.streams.filter(only_audio=True, file_extension='mp4').first()
-        
+        # ── Áudio ─────────────────────────────────────────────────
+        stream = (
+            yt.streams.filter(only_audio=True, file_extension='mp4').first()
+            or yt.streams.filter(only_audio=True).first()
+        )
         if not stream:
-             stream = yt.streams.filter(only_audio=True).first()
-
-        if not stream:
-            print("Nenhum stream de áudio encontrado.")
+            print("  ❌ Nenhum stream de áudio encontrado.")
             return None, None
 
-        print("Baixando stream de áudio...")
-        downloaded_file = stream.download(output_path=output_folder)
-        downloaded_file = os.path.abspath(downloaded_file)
-        print(f"Arquivo original baixado: {downloaded_file}")
+        print("  Baixando stream de áudio...")
+        raw_file = stream.download(output_path=output_folder)
+        raw_file = os.path.abspath(raw_file)
 
-        # Conversão
-        base_name = os.path.splitext(downloaded_file)[0]
-        mp3_filename = base_name + ".mp3"
-        ogg_filename = base_name + ".egg"
+        base      = os.path.splitext(raw_file)[0]
+        mp3_path  = base + ".mp3"
+        egg_path  = base + ".egg"
 
-        print("Convertendo áudio...")
-        
-        try:
-            audio = AudioSegment.from_file(downloaded_file)
-            
-            print(f"Salvando MP3: {mp3_filename}")
-            audio.export(mp3_filename, format="mp3")
-            
-            print(f"Salvando OGG (.egg): {ogg_filename}")
-            audio.export(ogg_filename, format="ogg")
-            
-            os.remove(downloaded_file)
-            print("Arquivo original removido.")
-            
-            return mp3_filename, cover_path
-            
-        except Exception as e_pydub:
-            print(f"Erro no pydub (provavelmente falta ffprobe): {e_pydub}")
-            print("Tentando conversão direta via ffmpeg...")
-            
-            import subprocess
-            
-            # Converter para MP3 via subprocesso
-            cmd_mp3 = [
-                ffmpeg_path, '-y', '-i', downloaded_file, 
-                '-vn', '-ar', '44100', '-ac', '2', '-b:a', '192k', mp3_filename
-            ]
-            subprocess.run(cmd_mp3, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print(f"MP3 salvo via ffmpeg: {mp3_filename}")
+        # Converte para MP3 (análise) e OGG/egg (Beat Saber) via ffmpeg
+        def _ffmpeg(in_file, out_file, extra_args=None):
+            cmd = [ffmpeg, '-y', '-i', in_file]
+            if extra_args:
+                cmd.extend(extra_args)
+            cmd.append(out_file)
+            subprocess.run(cmd, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            # Converter para OGG via subprocesso
-            cmd_ogg = [
-                ffmpeg_path, '-y', '-i', downloaded_file,
-                '-vn', '-acodec', 'libvorbis', ogg_filename
-            ]
-            subprocess.run(cmd_ogg, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print(f"OGG salvo via ffmpeg: {ogg_filename}")
-            
-            os.remove(downloaded_file)
-            return mp3_filename, cover_path
+        print("  Convertendo para MP3...")
+        _ffmpeg(raw_file, mp3_path,
+                ['-vn', '-ar', '44100', '-ac', '2', '-b:a', '192k'])
+
+        print("  Convertendo para OGG (.egg)...")
+        _ffmpeg(raw_file, egg_path, ['-vn', '-f', 'ogg'])
+
+        os.remove(raw_file)
+        print(f"  ✅ MP3: {mp3_path}")
+        return mp3_path, cover_path
 
     except Exception as e:
-        print(f"Erro geral: {e}")
+        print(f"  ❌ Erro no download: {e}")
         return None, None
 
+
 if __name__ == "__main__":
-    # Exemplo de uso
-    url = input("Insira a URL do YouTube: ")
+    url = input("URL do YouTube: ").strip()
     if url:
         mp3, cover = download_from_youtube(url)
         if mp3:
-            print(f"Processo concluído! MP3: {mp3}, Cover: {cover}")
+            print(f"Concluído! MP3: {mp3} | Cover: {cover}")

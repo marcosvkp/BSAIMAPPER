@@ -1,17 +1,47 @@
 import copy
-import random
+# random REMOVIDO — V14 e 100% deterministico
 
 class FlowFixer:
     """
-    Validador físico V13.
+    Validador fisico V14 — 100% deterministico, zero aleatoriedade.
 
-    Ordem de operações:
-      1. Remove tower stacks (mesma mão, mesmo timestamp)
-      2. Remove notas inatingíveis (distância física vs tempo)
-      3. _fix_swing: alternância + consistência de layer
-      4. _fix_edge: bordas da grade (roda depois do swing)
-      5. _fix_crossed_arms: braços cruzados em simultâneas
+    Ordem de operacoes:
+      1. Remove tower stacks (mesma mao, mesmo timestamp)
+      2. Remove notas inatingiveis (distancia fisica vs tempo)
+      3. _fix_edge: bordas da grade  <-- ANTES do swing
+      4. _fix_swing: alternancia + consistencia de layer
+      5. _fix_crossed_arms: bracos cruzados em simultaneas
       6. _fix_hitbox: doubles sobrepostos
+
+    IMPORTANTE: edge roda ANTES do swing.
+    Se edge rodar depois, pode converter um cut valido (ex: DOWN gerado
+    pelo swing) de volta para UP em layer=0, quebrando o swing recém corrigido.
+    Ex: UP(l=1) > UP(l=0)
+        swing corrige 2a para DOWN_RIGHT
+        edge veria DOWN_RIGHT em layer=0 e converteria para UP_RIGHT  <-- BUG
+    Com edge primeiro: a nota em layer=0 ja chega pre-processada ao swing,
+    e _best_cut escolhe um cut valido para aquela posicao + swing.
+
+    ================================================================
+    REGRA DE DOT (TRANSPARENTE)
+
+    DOTs NAO alteram o estado de swing. A ultima nota direcional
+    define o que a PROXIMA direcional deve ser, independente de
+    quantos DOTs existam no meio.
+
+    Garantido no mapa inteiro:
+      UP  > DOT > UP                INVALIDO  -> corrigido
+      UP  > DOT > DOWN              VALIDO    -> mantido
+      UP  > DOT > DOT > DOWN        VALIDO    -> mantido
+      UP  > DOT > DOT > UP          INVALIDO  -> corrigido
+      UP  > DOT > DOT > DOT > DOWN  VALIDO    -> mantido
+      UP  > DOT > DOT > DOT > UP    INVALIDO  -> corrigido
+      UP_LEFT > DOT > UP_LEFT       INVALIDO  -> corrigido
+      UP_LEFT > DOT > DOWN          VALIDO    -> mantido
+
+    _best_cut() e totalmente deterministico: prioridade fixa,
+    sem random.choice em nenhum caminho.
+    ================================================================
     """
 
     UP         = 0
@@ -31,40 +61,40 @@ class FlowFixer:
     MAX_LINE_JUMP_DIST  = 2
     MIN_BEATS_WIDE_JUMP = 0.4
 
-    # Componente vertical de cada direção
-    # 'up'   = braço subindo  (corta de baixo pra cima)
-    # 'down' = braço descendo (corta de cima pra baixo)
-    # None   = puramente horizontal
     VERT = {
         0: 'up',    # UP
         1: 'down',  # DOWN
-        2: None,    # LEFT
-        3: None,    # RIGHT
+        2: None,    # LEFT  (horizontal puro)
+        3: None,    # RIGHT (horizontal puro)
         4: 'up',    # UP_LEFT
         5: 'up',    # UP_RIGHT
         6: 'down',  # DOWN_LEFT
         7: 'down',  # DOWN_RIGHT
     }
 
-    # Após subir → deve descer. Após descer → deve subir.
+    VERT_OPP = {'up': 'down', 'down': 'up'}
+
     VALID_AFTER = {
-        'up':   {1, 6, 7},   # DOWN, DOWN_LEFT, DOWN_RIGHT
-        'down': {0, 4, 5},   # UP,   UP_LEFT,   UP_RIGHT
+        'up':   {1, 6, 7},
+        'down': {0, 4, 5},
     }
 
     OPPOSITE = {
-        0: 1, 1: 0,   # UP ↔ DOWN
-        2: 3, 3: 2,   # LEFT ↔ RIGHT
-        4: 7, 7: 4,   # UP_LEFT ↔ DOWN_RIGHT
-        5: 6, 6: 5,   # UP_RIGHT ↔ DOWN_LEFT
+        0: 1, 1: 0,
+        2: 3, 3: 2,
+        4: 7, 7: 4,
+        5: 6, 6: 5,
     }
 
-    # Cuts proibidos por posição na grade
-    # Calculado dinamicamente em _forbidden_for_pos
-    # col 0: sem LEFT, UP_LEFT, DOWN_LEFT
-    # col 3: sem RIGHT, UP_RIGHT, DOWN_RIGHT
-    # layer 0: sem DOWN, DOWN_LEFT, DOWN_RIGHT
-    # layer 2: sem UP, UP_LEFT, UP_RIGHT
+    # Ordem deterministica de preferencia por required_vert
+    # Apos UP   (required='down'): DOWN_RIGHT > DOWN_LEFT > DOWN
+    # Apos DOWN (required='up'):   UP_LEFT > UP_RIGHT > UP
+    _PREFER = {
+        'down': [7, 6, 1],
+        'up':   [4, 5, 0],
+        None:   [7, 4, 6, 5, 1, 0, 3, 2],
+    }
+
     _LEFT_FORBIDDEN   = {2, 4, 6}
     _RIGHT_FORBIDDEN  = {3, 5, 7}
     _BOTTOM_FORBIDDEN = {1, 6, 7}
@@ -79,20 +109,18 @@ class FlowFixer:
         if layer == 2: f |= FlowFixer._TOP_FORBIDDEN
         return f
 
-    # ─────────────────────────────────────────────────────────────
-    # Interface pública
-    # ─────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
+    # Interface publica
+    # -----------------------------------------------------------------
 
     @staticmethod
     def fix(notes, bpm):
         if not notes:
             return []
-
         stats = {
             "same_hand": 0, "edge": 0, "unreachable": 0,
             "swing": 0, "crossed": 0, "hitbox": 0,
         }
-
         notes = [copy.copy(n) for n in notes]
         notes.sort(key=lambda x: x['_time'])
 
@@ -106,12 +134,13 @@ class FlowFixer:
         left  = FlowFixer._remove_unreachable(left,  stats)
         right = FlowFixer._remove_unreachable(right, stats)
 
-        left  = FlowFixer._fix_swing(left,  stats)
-        right = FlowFixer._fix_swing(right, stats)
-
-        # Borda roda APÓS swing para não destruir intenção do modelo
+        # Edge ANTES do swing: garante que _best_cut nunca escolha
+        # um cut que sera invalidado pela borda logo em seguida.
         for n in left + right:
             FlowFixer._fix_edge(n, stats)
+
+        left  = FlowFixer._fix_swing(left,  stats)
+        right = FlowFixer._fix_swing(right, stats)
 
         all_notes = sorted(left + right, key=lambda x: x['_time'])
         all_notes = FlowFixer._fix_crossed_arms(all_notes, stats)
@@ -122,16 +151,16 @@ class FlowFixer:
         total = sum(stats.values())
         if total > 0:
             print(
-                f"      [FlowFixer V13] "
+                f"      [FlowFixer V14] "
                 f"same_hand={stats['same_hand']} | edge={stats['edge']} | "
                 f"unreachable={stats['unreachable']} | swing={stats['swing']} | "
                 f"crossed={stats['crossed']} | hitbox={stats['hitbox']}"
             )
         return result
 
-    # ─────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
     # 1. Tower stacks
-    # ─────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
 
     @staticmethod
     def _remove_simultaneous(hand_notes, stats):
@@ -152,9 +181,9 @@ class FlowFixer:
             i = j
         return result
 
-    # ─────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
     # 2. Atingibilidade
-    # ─────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
 
     @staticmethod
     def _remove_unreachable(hand_notes, stats):
@@ -172,172 +201,176 @@ class FlowFixer:
             prev_line = note['_lineIndex']
         return result
 
-    # ─────────────────────────────────────────────────────────────
-    # 3. Swing + consistência de layer
+    # -----------------------------------------------------------------
+    # 3. Bordas da grade  (roda ANTES do swing)
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _fix_edge(note, stats):
+        line  = note['_lineIndex']
+        layer = note['_lineLayer']
+        cut   = original = note['_cutDirection']
+        if cut == FlowFixer.DOT:
+            return
+        if line == 0:
+            if   cut == 2: note['_cutDirection'] = 8   # LEFT -> DOT
+            elif cut == 4: note['_cutDirection'] = 0   # UP_LEFT -> UP
+            elif cut == 6: note['_cutDirection'] = 1   # DOWN_LEFT -> DOWN
+        if line == 3:
+            if   cut == 3: note['_cutDirection'] = 8   # RIGHT -> DOT
+            elif cut == 5: note['_cutDirection'] = 0   # UP_RIGHT -> UP
+            elif cut == 7: note['_cutDirection'] = 1   # DOWN_RIGHT -> DOWN
+        cut = note['_cutDirection']
+        if layer == 0:
+            if   cut == 1: note['_cutDirection'] = 0   # DOWN -> UP
+            elif cut == 6: note['_cutDirection'] = 4   # DOWN_LEFT -> UP_LEFT
+            elif cut == 7: note['_cutDirection'] = 5   # DOWN_RIGHT -> UP_RIGHT
+        if layer == 2:
+            if   cut == 0: note['_cutDirection'] = 1   # UP -> DOWN
+            elif cut == 4: note['_cutDirection'] = 6   # UP_LEFT -> DOWN_LEFT
+            elif cut == 5: note['_cutDirection'] = 7   # UP_RIGHT -> DOWN_RIGHT
+        if note['_cutDirection'] != original:
+            stats['edge'] += 1
+
+    # -----------------------------------------------------------------
+    # 4. Swing — DOT TRANSPARENTE
     #
-    # Regra de swing: após componente 'up' → deve descer; após 'down' → deve subir.
-    # Criativo: aceita DOWN, DOWN_LEFT, DOWN_RIGHT após UP (não força DOWN puro).
+    # required_vert = componente vertical que a PROXIMA nota direcional DEVE ter.
+    #   - Inicia como None (qualquer coisa e valida)
+    #   - Apos nota com vert='up':   required_vert = 'down'
+    #   - Apos nota com vert='down': required_vert = 'up'
+    #   - Apos nota horizontal (None): required_vert nao muda
+    #   - Apos DOT (cut=8): required_vert NAO MUDA  <-- regra central
     #
-    # Regra de layer (o problema da imagem):
-    #   Se a nota atual está numa layer MAIS ALTA que a anterior (dlayer > 0),
-    #   o cut não pode ter componente 'up' — o braço chegou subindo nessa posição,
-    #   não faz sentido cortar para cima novamente em seguida sem descer antes.
-    #   Analogamente, layer mais baixa (dlayer < 0) não pode ter comp 'down'.
+    # Consequencia: independente de quantos DOTs ha entre duas notas
+    # direcionais, a regra de alternancia se aplica sempre.
     #
-    # DOT: consome o swing sem alterar direção.
-    #   UP → DOT → UP ✅  (DOT desceu, próxima sobe)
-    # ─────────────────────────────────────────────────────────────
+    # _best_cut() ja considera as bordas (_forbidden_for_pos), mas como
+    # _fix_edge rodou antes, as notas ja chegam aqui com cuts ajustados
+    # a suas posicoes, eliminando qualquer conflito residual.
+    # -----------------------------------------------------------------
 
     @staticmethod
     def _fix_swing(hand_notes, stats):
         if len(hand_notes) < 2:
             return hand_notes
 
-        result     = list(hand_notes)
-        prev_cut   = None
-        prev_layer = None
+        result = list(hand_notes)
+        required_vert = None   # componente vertical que a proxima direcional DEVE ter
+        prev_horiz    = None   # ultimo cut horizontal (LEFT=2 / RIGHT=3) visto
+        prev_layer    = None
 
         for note in result:
             cut   = note['_cutDirection']
             layer = note['_lineLayer']
             col   = note['_lineIndex']
 
-            # DOT: avança prev_cut sem corrigir a nota
+            # DOT: transparente — nao altera nenhum estado
             if cut == FlowFixer.DOT:
-                if prev_cut is not None:
-                    prev_cut = FlowFixer.OPPOSITE.get(prev_cut, prev_cut)
                 prev_layer = layer
                 continue
 
-            curr_vert  = FlowFixer.VERT.get(cut)
-            needs_fix  = False
+            curr_vert = FlowFixer.VERT.get(cut)
+            needs_fix = False
 
-            # ── Verifica swing ────────────────────────────────────
-            if prev_cut is not None:
-                prev_vert = FlowFixer.VERT.get(prev_cut)
-                if prev_vert is not None:
-                    if cut not in FlowFixer.VALID_AFTER[prev_vert]:
-                        needs_fix = True
-                else:
-                    # horizontal → oposto exato
-                    if cut != FlowFixer.OPPOSITE.get(prev_cut):
-                        needs_fix = True
+            # Verifica violacao de swing vertical
+            if required_vert is not None and curr_vert is not None:
+                if curr_vert != required_vert:
+                    needs_fix = True
 
-            # ── Verifica consistência de layer ────────────────────
-            # Se não vai corrigir por swing, ainda verifica layer
+            # Verifica repeticao horizontal: RIGHT>RIGHT ou LEFT>LEFT
+            if not needs_fix and curr_vert is None:
+                if prev_horiz is not None and cut == prev_horiz:
+                    needs_fix = True
+
+            # Verifica consistencia de layer
             if not needs_fix and prev_layer is not None:
                 dlayer = layer - prev_layer
                 if dlayer > 0 and curr_vert == 'up':
-                    # Subiu de layer mas quer cortar para cima — inconsistente
-                    # (caso da imagem: DOWN layer1 → UP layer2)
                     needs_fix = True
                 elif dlayer < 0 and curr_vert == 'down':
-                    # Desceu de layer mas quer cortar para baixo — inconsistente
                     needs_fix = True
 
             if needs_fix:
-                cut = FlowFixer._best_cut(prev_cut, prev_layer, col, layer)
+                cut = FlowFixer._best_cut(required_vert, prev_horiz, prev_layer, col, layer)
                 note['_cutDirection'] = cut
+                curr_vert = FlowFixer.VERT.get(cut)
                 stats['swing'] += 1
 
-            prev_cut   = cut
+            # Atualiza estado
+            if curr_vert is not None:
+                required_vert = FlowFixer.VERT_OPP[curr_vert]
+                prev_horiz = None   # nota com vert reseta o estado horizontal
+            else:
+                prev_horiz = cut    # registra o horizontal atual
+
             prev_layer = layer
 
         return result
 
     @staticmethod
-    def _best_cut(prev_cut, prev_layer, col, layer):
+    def _best_cut(required_vert, prev_horiz, prev_layer, col, layer):
         """
-        Escolhe o melhor cut respeitando:
-          1. Swing (componente vertical oposto ao anterior)
-          2. Consistência de layer (dlayer > 0 → não pode ser 'up')
-          3. Bordas da grade
-          4. Preferência pelo oposto exato (preserva criatividade)
-          5. Fallback: qualquer válido da lista de swing
-          6. Último recurso: DOT (só se não há nenhuma opção válida)
+        Escolhe o melhor cut — 100% deterministico, sem random em nenhum caminho.
+
+        required_vert : componente vertical obrigatorio ('up'/'down'/None)
+        prev_horiz    : ultimo cut horizontal (2=LEFT / 3=RIGHT / None)
+                        se definido, o cut escolhido nao pode ser igual a ele
+        prev_layer    : layer da nota anterior (para consistencia de layer)
+
+        Prioridade fixa:
+          Passe 1: required_vert + nao repete horiz + borda + layer
+          Passe 2: required_vert + nao repete horiz + borda (relaxa layer)
+          Passe 3: required_vert + nao repete horiz (relaxa tudo)
+          Passe 4: qualquer cut nao proibido
+          Fallback: DOT
         """
         forbidden = FlowFixer._forbidden_for_pos(col, layer)
 
-        # Candidatos de swing
-        if prev_cut is not None:
-            prev_vert = FlowFixer.VERT.get(prev_cut)
-            if prev_vert is not None:
-                candidates = list(FlowFixer.VALID_AFTER[prev_vert])
-            else:
-                opp = FlowFixer.OPPOSITE.get(prev_cut)
-                candidates = [opp] if opp is not None else list(range(8))
-        else:
-            candidates = list(range(8))
-
-        # Filtra por borda
-        grid_ok = [c for c in candidates if c not in forbidden]
-
-        # Filtra por consistência de layer
-        if prev_layer is not None:
+        def layer_ok(c):
+            if prev_layer is None:
+                return True
+            v = FlowFixer.VERT.get(c)
             dlayer = layer - prev_layer
-            if dlayer > 0:
-                # Subiu de layer → não pode ter comp 'up'
-                layer_ok = [c for c in grid_ok if FlowFixer.VERT.get(c) != 'up']
-            elif dlayer < 0:
-                # Desceu de layer → não pode ter comp 'down'
-                layer_ok = [c for c in grid_ok if FlowFixer.VERT.get(c) != 'down']
-            else:
-                layer_ok = grid_ok
-        else:
-            layer_ok = grid_ok
+            if dlayer > 0 and v == 'up':
+                return False
+            if dlayer < 0 and v == 'down':
+                return False
+            return True
 
-        pool = layer_ok if layer_ok else (grid_ok if grid_ok else candidates)
+        def horiz_ok(c):
+            # Nao pode repetir o mesmo horizontal
+            if prev_horiz is not None and FlowFixer.VERT.get(c) is None:
+                return c != prev_horiz
+            return True
 
-        if not pool:
-            return FlowFixer.DOT
+        order = FlowFixer._PREFER.get(required_vert, FlowFixer._PREFER[None])
 
-        # Prefere oposto exato
-        exact = FlowFixer.OPPOSITE.get(prev_cut)
-        if exact in pool:
-            return exact
+        # Passe 1: tudo ok
+        for c in order:
+            if c not in forbidden and layer_ok(c) and horiz_ok(c):
+                return c
 
-        # Prefere diagonais sobre puros (mais criativo)
-        diagonals = [c for c in pool if c in {4, 5, 6, 7}]
-        if diagonals:
-            return random.choice(diagonals)
+        # Passe 2: relaxa layer
+        for c in order:
+            if c not in forbidden and horiz_ok(c):
+                return c
 
-        return random.choice(pool)
+        # Passe 3: relaxa bordas mas mantem horiz
+        for c in order:
+            if horiz_ok(c):
+                return c
 
-    # ─────────────────────────────────────────────────────────────
-    # 4. Bordas
-    # ─────────────────────────────────────────────────────────────
+        # Passe 4: qualquer nao proibido
+        for c in FlowFixer._PREFER[None]:
+            if c not in forbidden:
+                return c
 
-    @staticmethod
-    def _fix_edge(note, stats):
-        line, layer = note['_lineIndex'], note['_lineLayer']
-        cut = original = note['_cutDirection']
+        return FlowFixer.DOT
 
-        if line == 0:
-            if   cut == 2: note['_cutDirection'] = 8  # LEFT → DOT
-            elif cut == 4: note['_cutDirection'] = 0  # UP_LEFT → UP
-            elif cut == 6: note['_cutDirection'] = 1  # DOWN_LEFT → DOWN
-        if line == 3:
-            if   cut == 3: note['_cutDirection'] = 8  # RIGHT → DOT
-            elif cut == 5: note['_cutDirection'] = 0  # UP_RIGHT → UP
-            elif cut == 7: note['_cutDirection'] = 1  # DOWN_RIGHT → DOWN
-
-        cut = note['_cutDirection']
-
-        if layer == 0:
-            if   cut == 1: note['_cutDirection'] = 0  # DOWN → UP
-            elif cut == 6: note['_cutDirection'] = 4  # DOWN_LEFT → UP_LEFT
-            elif cut == 7: note['_cutDirection'] = 5  # DOWN_RIGHT → UP_RIGHT
-        if layer == 2:
-            if   cut == 0: note['_cutDirection'] = 1  # UP → DOWN
-            elif cut == 4: note['_cutDirection'] = 6  # UP_LEFT → DOWN_LEFT
-            elif cut == 5: note['_cutDirection'] = 7  # UP_RIGHT → DOWN_RIGHT
-
-        if note['_cutDirection'] != original:
-            stats['edge'] += 1
-
-    # ─────────────────────────────────────────────────────────────
-    # 5. Braços cruzados (simultâneas)
-    # ─────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
+    # 5. Bracos cruzados (simultaneas)
+    # -----------------------------------------------------------------
 
     @staticmethod
     def _fix_crossed_arms(all_notes, stats):
@@ -361,9 +394,9 @@ class FlowFixer:
             i += 1
         return result
 
-    # ─────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
     # 6. Hitbox doubles
-    # ─────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
 
     @staticmethod
     def _fix_hitbox(all_notes, stats):
